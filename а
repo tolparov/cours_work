@@ -1,149 +1,473 @@
+package ru.sber.poirot.grs.registry.impl
+
+import org.springframework.stereotype.Service
+import ru.sber.poirot.grs.registry.RegistryRequest
+import ru.sber.poirot.grs.registry.impl.FilterType.*
+import ru.sber.poirot.grs.scheme.dto.SchemeDto
+import java.time.LocalDate
+
+@Service
+class RegistryFilterProviderImpl : RegistryFilterProvider {
+
+    override suspend fun filterItems(items: List<SchemeDto>, request: RegistryRequest?): List<SchemeDto> {
+        return request?.let { applyFilters(items, it) } ?: items
+    }
+
+    private fun applyFilters(items: List<SchemeDto>, request: RegistryRequest): List<SchemeDto> {
+        return items.asSequence()
+            .filter { item -> filterByDates(item, request.fromDate, request.toDate) }
+            .filter { item -> applyFieldFilters(item, request.filters) }
+            .toList()
+    }
+
+    private fun filterByDates(item: SchemeDto, fromDate: LocalDate?, toDate: LocalDate?): Boolean {
+        return (fromDate == null || !item.createdAt.toLocalDate().isBefore(fromDate)) &&
+                (toDate == null || !item.createdAt.toLocalDate().isAfter(toDate))
+    }
+
+    private fun applyFieldFilters(item: SchemeDto, filters: List<RegistryRequest.Companion.RegistryFilter>): Boolean {
+        if (filters.isEmpty()) return true
+
+        val groupedFilters = filters.groupBy { FilterType.fromString(it.fieldName) }
+
+        return groupedFilters.all { (type, filters) ->
+            when (type) {
+                NAME -> filters.any { item.name.contains(it.fieldValue, ignoreCase = true) }
+                CURATOR -> filters.any { it.fieldValue.equals(item.curator, ignoreCase = true) }
+                MANAGER -> filters.any { it.fieldValue.equals(item.manager, ignoreCase = true) }
+                STATUS -> filters.any { it.fieldValue.equals(item.status, ignoreCase = true) }
+                TAGS -> item.tags?.any { tag -> filters.any { tag.equals(it.fieldValue, ignoreCase = true) } } ?: false
+                UPDATED_AT -> filters.any { filter ->
+                    item.updatedAt.toLocalDate() == LocalDate.parse(filter.fieldValue)
+                }
+
+                PARTICIPANT_FL -> item.participants?.any { p ->
+                    p.isFL && p.fioDr?.contains(filters.first().fieldValue, ignoreCase = true) == true
+                } ?: false
+
+                PARTICIPANT_UL -> item.participants?.any { p ->
+                    !p.isFL && p.inn?.contains(filters.first().fieldValue) == true
+                } ?: false
+
+                TRACE_IP -> item.traces?.any { t ->
+                    t.traceType.equals("IP", ignoreCase = true) &&
+                            t.traceValue.contains(filters.first().fieldValue, ignoreCase = true)
+                } ?: false
+
+                TRACE_IMEI -> item.traces?.any { t ->
+                    t.traceType.equals("IMEI", ignoreCase = true) &&
+                            t.traceValue.contains(filters.first().fieldValue, ignoreCase = true)
+                } ?: false
+            }
+        }
+    }
+}package ru.sber.poirot.grs.registry.impl
+
+import org.springframework.stereotype.Service
+import ru.sber.poirot.grs.registry.Registry
+import ru.sber.poirot.grs.registry.RegistryItem
+import ru.sber.poirot.grs.registry.RegistryItem.Companion.toRegistryItem
+import ru.sber.poirot.grs.registry.RegistryRequest
+import ru.sber.poirot.grs.scheme.fetch.SchemeFetcher
+import java.time.LocalDateTime
+
+@Service
+class RegistryImpl(
+    private val schemeDao: SchemeFetcher,
+    private val filterProvider: RegistryFilterProvider,
+    private val excelGenerator: Generator
+) : Registry {
+
+    override suspend fun getItems(request: RegistryRequest?): List<RegistryItem> {
+        val allSchemes = schemeDao.fetchAllWithRelations()
+        val filteredSchemes = filterProvider.filterItems(allSchemes, request)
+        return filteredSchemes.map { it.toRegistryItem() }
+    }
+
+    override suspend fun download(
+        request: RegistryRequest?,
+        generationTime: LocalDateTime,
+        userLogin: String
+    ): ByteArray {
+        val items = getItems(request).sortedBy { it.updatedAt }.reversed()
+        return excelGenerator.getSchemeFile(items, generationTime, userLogin)
+    }
+}package ru.sber.poirot.grs.scheme.fetch
+
+import org.springframework.stereotype.Repository
+import ru.sber.poirot.engine.dsl.*
+import ru.sber.poirot.engine.dsl.filters.SqlFilter.Companion.emptyFilter
+import ru.sber.poirot.engine.metamodel.*
+import ru.sber.poirot.engine.model.api.grs.FraudScheme
+import ru.sber.poirot.engine.model.full.grs.FraudTag
+import ru.sber.poirot.grs.shared.error.GroupsRelatedScamsErrorCode.SCHEME_NOT_FOUND
+import ru.sber.poirot.exception.FrontException
+import ru.sber.poirot.grs.participant.dto.ParticipantDto
+import ru.sber.poirot.grs.scheme.dto.SchemeDto
+import ru.sber.poirot.grs.scheme.dto.TaskInfoDto
+import ru.sber.poirot.grs.shared.model.GroupsRelatedScamsStatus.DELETED
+import ru.sber.poirot.grs.shared.model.toSchemeWithRelationDto
+import ru.sber.poirot.grs.trace.dto.TraceDto
+import ru.sber.poirot.utils.withMeasurement
+import ru.sber.utils.letIfNotNull
+import ru.sber.utils.logger
+
+@Repository
+class SchemeFetcherImpl : SchemeFetcher {
+    private val log = logger()
+
+    override suspend fun fetchAllWithRelations(): List<SchemeDto> =
+        withMeasurement(message = "Fetch schemes", logger = log) {
+            (findAll(fraudScheme, batch = false) fetchFields {
+                allFieldsWithRelations
+            } where {
+                emptyFilter()
+            }).map { it.toSchemeWithRelationDto() }
+        }
+
+    override suspend fun fetchVersionById(id: Long): Long =
+        withMeasurement(message = "Fetch scheme version by id", logger = log) {
+            (findFirst(fraudScheme, batch = false) fetchFields {
+                listOf(version)
+            } where {
+                (fraudScheme.id `=` id)
+            })?.version ?: throw FrontException(SCHEME_NOT_FOUND.description.format(id))
+        }
 
 
-Саша, какие сроки ?
+    override suspend fun existById(id: Long): Boolean =
+        withMeasurement(message = "Exist scheme by id", logger = log) {
+            existsAny(fraudScheme.id, batch = false) where {
+                (fraudScheme.id `=` id)
+            }
+        }
 
- 
-
-Алан, скидывай мне в сберчат что нагенеришь – дальше почистим/добавим. Можно просто тезисно накидать.  В идеале какие новые технологии ты изучил, библиотеки применил и т.д.
-
-То есть, нужно показать что ты вырос с точки зрения экспертизы, а не хорошо выполняешь свои задачи (это про  5+ ). Постарайся вспомнить любые библиотеки, подходы, паттерны, которые ты изучил за последний год.
-
- 
-
- 
-
-От: Лапенков Александр Александрович <Lapenkov.A.Al@sberbank.ru>
-Дата: пятница, 10 октября 2025 г. в 16:57
-Кому: Толпаров Алан Артурович <AATolparov@sberbank.ru>
-Копия: Кривонос Константин Сергеевич <Krivonos.K.Se@sberbank.ru>, Марухин Александр Александрович <AAMarukhin@sberbank.ru>
-Тема: Re: Фактура для повышения
-
- 
-
-Алан, привет!
-
- 
-
-Давай переделаем обоснование с учетом новых достижений
-
-Нужно больше фактуры по новым технологиям/инструментам (тот же WebSockets – что еще?), выделение справочников в отдельный сервис для улучшения архитектуры…
-
- 
-
-То есть не перечень функциональности, которую ты реализовал с точки зрения бизнеса, а чему новому ты научился, что дополнительно на себя взял. Может Костя (в отсутствие Саши) сможет помочь
-
- 
-
- 
-
- 
-
-С уважением,
-
-Лапенков Александр
-
-ИТ лидер продуктов Антифрод в корпоративном кредитовании,
-
-Портфельная аналитика и
-
-Smart Collection
-
-Управление развития технологий Корпоративных Рисков
-
-БЦ «КНОП», каб. 423, место 28
-
-Тел. (495) 665-56-00 вн. (557) 15728
-
-Моб. +7 (916) 171-50-06
-
-SIGMA e-mail: Lapenkov.A.Al@sberbank.ru
-
- 
-
- 
-
- 
-
- 
-
-От: Толпаров Алан Артурович <AATolparov@sberbank.ru>
-Организация: Толпаров Алан Артурович
-Дата: четверг, 28 августа 2025 г. в 12:29
-Кому: Лапенков Александр Александрович <Lapenkov.A.Al@sberbank.ru>
-Тема: Фактура для повышения
-
- 
-
-Александр, привет!
-
-Фактура для повышения:
-
-За 2025г выполнил разработку для развития следующих компонентов системы:
-
-1. Визуализация источников данных:
-
-- автоматизация ограничения доступа к инсайдерской информации по признаку БИТЛ
-
-- реализация новых прав для вкладки с ML-моделями для более гибкой настройки изоляции доступа сберлизинга
-
-- поддержка вкладки с ML-моделями: переход на новые версии моделей, адаптация к источникам ЕСПД вазмен TFS
-
- 
-
-2. Бизнес-процесс "Группы связанных мошенников"
-
-- реализация нового рабочего места и соответствующего сервиса, полностью покрывающего бизнес-процесс, который ранее был ручным и вне системы
-
-- интеграция нового сервиса с другими компонентами АС Пуаро, интеграция с АС ДИС, конкурентное редактирование сущностей процесса несколькими пользователями
-
- 
-
-3. Оценка фрод-риска - добавление на экран управления наборами правил функционала игнорирования ролей для повышения гибкости и прозрачности настройки скоринга
-
- 
-
-4. Исследование применимости протокола WebSocket к модулям АС Пуаро для повышения отзывчивости UI и оптимизации пользовательских путей
-
- 
-
-Также в течение года проявлял дополнительно инициативу и и выполнил действия сверх плана: 
-
-- сделал работу по выделению общей корзины в отдельный сервис для улучшения архитектуры системы
-
-- взял на себя поддержку тестирования и доработку функционала продления SLA и переназначения в АС ДИС в период отсутствия коллеги, оперативно устранив критические проблемы блокирующие тестирование
-
-- регулярно оказывал консультации коллегам из тестирования: помощь с деплоем, обучение инструментам быстрой раскатки с помощью OpenShift
-
- 
+    override suspend fun fetchTagMappingIdsBySchemeId(id: Long): List<Long> =
+        withMeasurement(message = "Fetch tags ids by schemeId", logger = log) {
+            (findAll(entity = fraudTagMapping, batch = false) fetchFields {
+                listOf(fraudTagMapping.id)
+            } where {
+                fraudTagMapping.schemeId `=` id
+            }).map { it.id }
+        }
 
 
-С уважением,
-Толпаров Алан Артурович
-Старший инженер по разработке, Управление развития технологий Рисков КИБ
-Даем людям уверенность и надежность!
+    override suspend fun fetchById(id: Long): FraudScheme =
+        withMeasurement(message = "Fetch scheme by id", logger = log) {
+            (findFirst(fraudScheme, batch = false) fetchFields {
+                allFields
+            } where {
+                (fraudScheme.id `=` id)
+            }) ?: throw FrontException(SCHEME_NOT_FOUND.description.format(id))
+        }
 
-Я разработчик на kotlin мне нужно обновить фактуру с учетом закрытие нового квартал и переписать ее с точки зрения личностного роста
-(Вот пример того, что устроит Сашу
+    override suspend fun fetchParticipantById(schemeId: Long): List<ParticipantDto> {
+        // 1. Получаем ID всех участников схемы
+        val participantIds = withMeasurement("Fetch participant IDs for scheme", logger = log) {
+            (findAll(fields = listOf(fraudScheme.participantsMapping.participant.id), batch = false) where {
+                fraudScheme.id `=` schemeId
+                fraudScheme.participantsMapping.participant.id.isNotNull()
+            }).flatten().map { it as Long }
+        }
 
-Расширил компетенции по использованию coroutine в Kotlin, что позволило эффективнее реализовывать многопоточные сервисы. Полученные знания применил на практике путем оптимизации такого то бизнес-процесса
-Так же углубил знания Spring WebFlux и Spring MVC , что позволило реализовывать потоковую обработку данных и оптимизировать код микросервисов за счет его упрощения
-17:34) - это пример кадолжна выглдяить фактура 
-это мой отчет за третий квартал которого нет в старой фактуре для повышения 
- Основные результаты за 3 квартал:
-1700/2000
-1. Ключевая задача квартала: Реализация эпика для Группы фрод-мониторинга (ГФМ)
-- В сжатые сроки, обусловленные поздним поступлением требований, разработал и успешно зарелизил полноценное MVP-решение к дедлайну квартала. Для выполнения обязательств была организована работа в выходной день.
-2. Техническая задача: Интеграция с фронтендом через WebSockets
-- Решил ключевую инфраструктурную проблему с прокси-сервисами, впервые
-- обеспечив возможность работы технологии веб-сокетов в проекте. Функционал полностью реализован в теневом режиме и будет выведен в пром в ближайшем релизе.
-3. Запуск нового сервиса «Группы связанных мошенников»
-- Вывел в пром новый сервис с нуля и параллельно закрыл большую часть дополнительных пожеланий пользователей, не входивших в изначальный план.
-4. Задачи, не начатые в отчетном периоде
-- Две квартальные цели ([Автоматизация выставления WLI, Создание отчета по антифрод модели]) не были начаты по причине отсутствия бизнес-требований.
-5. Работа сверх плана
-- Внес вклад в создание универсального сервиса задач, реализовав для него сервис «Виджет фрод-признаков».
-- Улучшил клиентский опыт, добавив подсказку по наборам для скоринга в зависимости от роли пользователя.
-- Провел работу по замене и выводу из эксплуатации устаревшей модели ММБ.
-- Выполнил выделение справочников в отдельный сервис для улучшения архитектуры системы.
-Итоги квартала:
-Несмотря на блокирующие факторы (отсутствие требований по 2 целям и смещение дедлайна по сокетам), ключевая задача квартала была успешно сдана в срок, а также достигнуты значительные результаты сверх плана. Все работы, для которых были созданы условия, выполнены.
+        if (participantIds.isEmpty()) {
+            return emptyList()
+        }
+
+        // 2. Получаем статусы и исполнителей задач для этих участников
+        val tasksInfo = withMeasurement("Fetch task executor and status", logger = log) {
+            (findAll(with(taskRegistry) {
+                listOf(
+                    taskRegistry.participantId,
+                    taskRegistry.status,
+                    taskRegistry.executor
+                )
+            }, batch = false) where {
+                taskRegistry.participantId `in` participantIds
+                taskRegistry.schemeId `=` schemeId
+                taskRegistry.status `!=` DELETED.status.inlined
+            } convertTo {
+                TaskInfoDto(
+                    participantId = nextField() as Long,
+                    status = nextField(),
+                    executor = nextField()
+                )
+            }).groupBy { it.participantId }
+        }
+
+        return withMeasurement("Fetch participant details", logger = log) {
+            findAll(fields = with(fraudParticipant) {
+                listOf(
+                    fraudScheme.participantsMapping.participant.id,
+                    fraudScheme.participantsMapping.participant.fL,
+                    fraudScheme.participantsMapping.participant.inn,
+                    fraudScheme.participantsMapping.participant.ogrn,
+                    fraudScheme.participantsMapping.participant.firstName,
+                    fraudScheme.participantsMapping.participant.lastName,
+                    fraudScheme.participantsMapping.participant.secondName,
+                    fraudScheme.participantsMapping.participant.region,
+                    fraudScheme.participantsMapping.participant.birthDate,
+                    fraudScheme.participantsMapping.participant.ctlValidform,
+                    fraudScheme.participantsMapping.role,
+                    fraudScheme.participantsMapping.comment,
+                    fraudScheme.participantsMapping.similarityCriteria,
+                )
+            }, batch = false) where {
+                fraudScheme.participantsMapping.participant.id `in` participantIds
+                fraudScheme.participantsMapping.schemeId `=` schemeId
+            } convertTo {
+                val participantId = nextField() as Long
+                val taskInfo = tasksInfo[participantId]?.firstOrNull()
+
+                ParticipantDto(
+                    id = participantId,
+                    isFL = nextField(),
+                    inn = nextField(),
+                    ogrn = nextField(),
+                    firstName = nextField(),
+                    lastName = nextField(),
+                    secondName = nextField(),
+                    region = nextField(),
+                    birthDate = nextField(),
+                    status = taskInfo?.status,
+                    executor = taskInfo?.executor,
+                    createdAt = nextField(),
+                    roles = nextField<String>().letIfNotNull{ it.split(",") } ?: emptyList(),
+                    comment = nextField(),
+                    similarityCriteria = nextField()
+                )
+            }
+        }
+    }
+
+    override suspend fun fetchTraceById(schemeId: Long): List<TraceDto> {
+        val traceIds = withMeasurement("Fetch trace IDs for scheme", logger = log) {
+            (findAll(fields = listOf(fraudScheme.tracesMapping.trace.id), batch = false) where {
+                fraudScheme.id `=` schemeId
+                fraudScheme.tracesMapping.trace.id.isNotNull()
+            }).flatten().map { it as Long }
+        }
+
+        if (traceIds.isEmpty()) {
+            return emptyList()
+        }
+
+        return withMeasurement(message = "Fetch traces by id", logger = log) {
+            findAll(fields = with(fraudTrace) {
+                listOf(
+                    fraudScheme.tracesMapping.trace.id,
+                    fraudScheme.tracesMapping.trace.traceType,
+                    fraudScheme.tracesMapping.trace.traceValue,
+                    fraudScheme.tracesMapping.trace.ctlValidform,
+                    fraudScheme.tracesMapping.comment
+                )
+            }, batch = false) where {
+                fraudScheme.tracesMapping.trace.id `in` traceIds
+                fraudScheme.tracesMapping.schemeId `=` schemeId
+            } convertTo {
+                TraceDto(
+                    id = nextField(),
+                    traceType = nextField(),
+                    traceValue = nextField(),
+                    createdAt = nextField(),
+                    comment = nextField()
+                )
+            }
+        }
+    }
+
+    override suspend fun fetchByNameIn(tagNames: List<String>): List<FraudTag> =
+        withMeasurement(message = "Fetch tags", logger = log) {
+            (findAll(entity = fraudTag, batch = false) fetchFields {
+                allFields
+            } where {
+                fraudTag.name `in` tagNames
+            }).map {
+                FraudTag().apply {
+                    id = it.id
+                    name = it.name
+                }
+            }
+        }
+
+    override suspend fun fetchTagsForSchemes(schemeIds: List<Long>): Map<Long, List<String>> =
+        (findAll(entity = fraudTagMapping, batch = false) fetchFields {
+            listOf(fraudTagMapping.schemeId, fraudTagMapping.tag.name)
+        } where {
+            fraudTagMapping.schemeId `in` schemeIds
+        }).groupBy(
+            { it.schemeId },
+            { it.tag.name }
+        )
+
+    override suspend fun fetchAllTags(): List<String> =
+        (findAll(entity = fraudTag, batch = false) fetchFields {
+            listOf(name)
+        } where {
+            emptyFilter()
+        }).map { it.name }.toList()
+
+}
+package ru.sber.poirot.grs.shared.model
+
+import ru.sber.poirot.engine.dsl.convertTo
+import ru.sber.poirot.engine.model.api.grs.FraudParticipant
+import ru.sber.poirot.engine.model.api.grs.FraudTrace
+import ru.sber.poirot.engine.model.api.grs.TaskRegistry
+import ru.sber.poirot.engine.model.full.grs.FraudScheme
+import ru.sber.poirot.grs.registry.impl.dto.ParticipantFilterDto
+import ru.sber.poirot.grs.registry.impl.dto.TraceFilterDto
+import ru.sber.poirot.grs.scheme.dto.SchemeDto
+import ru.sber.poirot.grs.shared.model.GroupsRelatedScamsStatus.Companion.by
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import kotlin.collections.map
+
+fun GroupsRelatedScams.toEntity(): TaskRegistry {
+    val self = this@toEntity
+    return ru.sber.poirot.engine.model.full.grs.TaskRegistry().apply {
+        id = self.taskId
+        participantId = self.participantId
+        schemeId = self.schemeId
+        status = self.status.status
+        creationDateTime = self.creationDateTime
+        changed = self.changed
+        dateApproval = self.dateApproval
+        approver = self.approver
+        initiator = self.initiator
+        decision = self.decision
+        executor = self.executor
+        inn = self.inn
+    }
+}
+
+fun TaskRegistry.toDto(): GroupsRelatedScams =
+    GroupsRelatedScams(
+        taskId = id,
+        participantId = participantId,
+        schemeId = schemeId,
+        status = by(status),
+        creationDateTime = creationDateTime,
+        changed = changed,
+        dateApproval = dateApproval,
+        approver = approver,
+        initiator = initiator,
+        decision = decision,
+        executor = executor,
+        inn = inn
+    )
+
+fun List<List<Any?>>.toSchemeDto(): List<SchemeDto> = convertTo {
+    SchemeDto(
+        id = nextField(),
+        name = nextField(),
+        description = nextField(),
+        curator = nextField(),
+        manager = nextField(),
+        supervision = nextField(),
+        status = nextField(),
+        reasonReturn = nextField(),
+        createdAt = nextField(),
+        updatedAt = nextField()
+    )
+}
+
+fun ru.sber.poirot.engine.model.api.grs.FraudScheme.updateSchemaInfo(newStatus: String, reason: String? = null): FraudScheme {
+    val self = this@updateSchemaInfo
+    return FraudScheme().apply {
+        id = self.id
+        name = self.name
+        description = self.description
+        curator = self.curator
+        manager = self.manager
+        supervision = self.supervision
+        status = newStatus
+        reasonReturn = reason
+        ctlValidform = self.ctlValidform
+        updatedAt = self.updatedAt
+        version = self.version
+    }
+}
+
+fun ru.sber.poirot.engine.model.api.grs.FraudScheme.toSchemeWithRelationDto(): SchemeDto {
+    val self = this@toSchemeWithRelationDto
+    return SchemeDto(
+            id = self.id,
+            name = self.name,
+            description = self.description,
+            curator = self.curator,
+            manager = self.manager,
+            supervision = self.supervision,
+            status = self.status,
+            reasonReturn = self.reasonReturn,
+            tags = self.tagsMapping.mapNotNull { it.tag?.name },
+            participants = self.participantsMapping.mapNotNull { it.participant?.toParticipantDto() },
+            traces = self.tracesMapping.mapNotNull { it.trace?.toTraceDto() },
+            createdAt = self.ctlValidform,
+            updatedAt = self.updatedAt
+        )
+
+}
+
+fun FraudParticipant.toParticipantDto(): ParticipantFilterDto {
+    val self = this@toParticipantDto
+    return ParticipantFilterDto(
+        isFL = self.fl,
+        inn = self.inn,
+        fioDr = buildFioDob(self.lastName, self.firstName, self.secondName, self.birthDate)
+    )
+}
+
+fun FraudTrace.toTraceDto(): TraceFilterDto {
+    val self = this@toTraceDto
+    return TraceFilterDto(
+        traceType = self.traceType,
+        traceValue = self.traceValue
+    )
+}
+
+private fun buildFioDob(lastName: String?, firstName: String?, secondName: String?, birthDate: LocalDate?): String? {
+    if (birthDate == null) return null
+
+    return listOfNotNull(
+        lastName,
+        firstName,
+        secondName.takeIf { !it.isNullOrEmpty() }
+    ).takeIf { it.size >= 2 }?.joinToString("|")
+        ?.let { fio -> "$fio|${birthDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))}" }
+}package ru.sber.poirot.grs.registry.impl.dto
+
+data class ParticipantFilterDto(
+    val isFL: Boolean,
+    val inn: String? = null,
+    var fioDr: String? = null,
+)
+package ru.sber.poirot.grs.registry.impl.dto
+
+data class TraceFilterDto(
+    val traceType: String,
+    val traceValue: String,
+)
+package ru.sber.poirot.grs.registry
+
+import io.swagger.v3.oas.annotations.media.Schema
+import ru.sber.poirot.grs.registry.impl.FilterType
+import java.time.LocalDate
+
+data class RegistryRequest(
+    @Schema(description = "Изначальная дата для фильтрации")
+    val fromDate: LocalDate,
+    @Schema(description = "Конечная дата для фильтрации (включительно)")
+    val toDate: LocalDate,
+    @Schema(description = "Дополнительные фильтры")
+    val filters: List<RegistryFilter> = emptyList(),
+) {
+    companion object {
+        data class RegistryFilter(
+            @Schema(description = "Название фильтра", implementation = FilterType::class)
+            val fieldName: String,
+            @Schema(description = "Значение фильтра")
+            val fieldValue: String,
+        )
+    }
+} мне нужно чтоб если мы указываем несколько фильтров ты мы иискали так чтоб каждая схема удовлетворял всем фильтрам одновременно 
