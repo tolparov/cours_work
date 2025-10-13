@@ -1,40 +1,90 @@
-private fun applyFieldFilters(item: SchemeDto, filters: List<RegistryRequest.Companion.RegistryFilter>): Boolean {
-    if (filters.isEmpty()) return true
+suspend fun fetchUlDebts(inns: List<String>): List<UlDebtDto> =
+    findAll(
+        fields = listOf(
+            arrearsClientUl.inn,
+            arrearsAgreement.debtAmount,
+            arrearsAgreement.curDebtOverAmount,
+            arrearsAgreement.curPercOverAmount,
+            arrearsAgreement.curDebtOverDate,
+            arrearsAgreement.curPercOverDate
+        ),
+        batch = true
+    ) join {
+        arrearsRoleLink.customerId `=` arrearsClientUl.customerId
+        arrearsAgreement.agreementId `=` arrearsRoleLink.agreementId
+    } where {
+        arrearsClientUl.inn `in` inns and
+                arrearsRoleLink.role `=` "Заемщик"
+    } convertTo {
+        val inn = nextField<String>()
+        val totalCurrentDebt = nextField<Double?>() ?: 0.0
+        val curDebtOver = nextField<Double?>() ?: 0.0
+        val curPercOver = nextField<Double?>() ?: 0.0
+        val curDebtOverDate = nextField<LocalDate?>()
+        val curPercOverDate = nextField<LocalDate?>()
 
-    val groupedFilters = filters.groupBy { FilterType.fromString(it.fieldName) }
+        UlDebtDto(
+            clientInn = inn,
+            totalCurrentDebt = totalCurrentDebt,
+            totalOverdueDebt = curDebtOver + curPercOver,
+            prncpOverdueDays = daysBetweenToday(curDebtOverDate),
+            intrstOverdueDays = daysBetweenToday(curPercOverDate)
+        )
+    }
+suspend fun fetchFlDebts(fioDobs: List<String>): List<FlDebtDto> {
+    return fioDobs.flatMap { fioDob ->
+        val parts = fioDob.split("|")
+        if (parts.size !in 3..4) {
+            throw FrontException(INCORRECT_ROW_SIZE.description)
+        }
 
-    // Проверяем, что каждая группа фильтров удовлетворяется
-    return groupedFilters.all { (type, filters) ->
-        when (type) {
-            NAME -> filters.all { item.name.contains(it.fieldValue, ignoreCase = true) }
-            CURATOR -> filters.all { it.fieldValue.equals(item.curator, ignoreCase = true) }
-            MANAGER -> filters.all { it.fieldValue.equals(item.manager, ignoreCase = true) }
-            STATUS -> filters.all { it.fieldValue.equals(item.status, ignoreCase = true) }
-            TAGS -> filters.all { filter -> item.tags?.any { it.equals(filter.fieldValue, ignoreCase = true) } ?: false }
-            UPDATED_AT -> filters.all { filter ->
-                item.updatedAt.toLocalDate() == LocalDate.parse(filter.fieldValue)
-            }
-            PARTICIPANT_FL -> filters.all { filter ->
-                item.participants?.any { p ->
-                    p.isFL && p.fioDr?.contains(filter.fieldValue, ignoreCase = true) == true
-                } ?: false
-            }
-            PARTICIPANT_UL -> filters.all { filter ->
-                item.participants?.any { p ->
-                    !p.isFL && p.inn?.contains(filter.fieldValue) == true
-                } ?: false
-            }
-            TRACE_IP -> filters.all { filter ->
-                item.traces?.any { t ->
-                    t.traceType.equals("IP", ignoreCase = true) &&
-                            t.traceValue.contains(filter.fieldValue, ignoreCase = true)
-                } ?: false
-            }
-            TRACE_IMEI -> filters.all { filter ->
-                item.traces?.any { t ->
-                    t.traceType.equals("IMEI", ignoreCase = true) &&
-                            t.traceValue.contains(filter.fieldValue, ignoreCase = true)
-                } ?: false
+        val lastName = parts[0]
+        val firstName = parts[1]
+        val middleName = parts.getOrNull(2)?.takeIf { it.isNotBlank() }
+        val birthDate = LocalDate.parse(parts.last(), DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+
+        val clients = findAll(entity = arrearsClientFl, batch = false) fetchFields {
+            listOf(arrearsClientFl.customerId)
+        } where {
+            arrearsClientFl.lastName `=` lastName.inlined and
+                    arrearsClientFl.firstName `=` firstName.inlined and
+                    arrearsClientFl.birthDate `=` birthDate.inlined and
+                    (middleName?.let { arrearsClientFl.middleName `=` it.inlined }
+                        ?: arrearsClientFl.middleName.isNull())
+        }
+
+        clients.flatMap { client ->
+            findAll(
+                fields = listOf(
+                    arrearsAgreement.agreementId,
+                    arrearsAgreement.debtAmount,
+                    arrearsAgreement.curDebtOverAmount,
+                    arrearsAgreement.curPercOverAmount,
+                    arrearsAgreement.curDebtOverDate,
+                    arrearsAgreement.curPercOverDate
+                ),
+                batch = false
+            ) join {
+                arrearsRoleLink.customerId `=` client.customerId.inlined and
+                        arrearsAgreement.agreementId `=` arrearsRoleLink.agreementId
+            } where {
+                arrearsRoleLink.role `=` "Заемщик".inlined
+            } convertTo {
+                val agreementId = nextField<String>()
+                val totalCurrentDebt = nextField<Double?>() ?: 0.0
+                val curDebtOver = nextField<Double?>() ?: 0.0
+                val curPercOver = nextField<Double?>() ?: 0.0
+                val curDebtOverDate = nextField<LocalDate?>()
+                val curPercOverDate = nextField<LocalDate?>()
+
+                FlDebtDto(
+                    agreementId = agreementId,
+                    clientFioDob = fioDob,
+                    totalCurrentDebt = totalCurrentDebt,
+                    totalOverdueDebt = curDebtOver + curPercOver,
+                    prncpOverdueDays = daysBetweenToday(curDebtOverDate),
+                    intrstOverdueDays = daysBetweenToday(curPercOverDate)
+                )
             }
         }
     }
