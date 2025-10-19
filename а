@@ -1,32 +1,22 @@
-package ru.sber.poirot.ai.chat.client
+package ru.sber.poirot.ai.chat.client.impl
 
-import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClient
-import ru.sber.poirot.ai.chat.config.AiChatProperties
+import ru.sber.poirot.ai.chat.client.AIChatClient
+import ru.sber.poirot.ai.chat.configs.AIChatClientProperties
 import ru.sber.poirot.ai.chat.dto.AskDto
 import ru.sber.poirot.ai.chat.dto.agent.AiAgentRequest
 import ru.sber.poirot.ai.chat.dto.agent.ModelSettingsDto
 import ru.sber.poirot.webclient.dsl.DslWebClient
 import ru.sber.poirot.webclient.dsl.post
-import ru.sber.utils.Retry
 
 @Service
-class AiChatClientImpl(
-    builder: WebClient.Builder,
-    private val props: AiChatProperties,
+class AIChatClientImpl(
+    private val dslClient: DslWebClient,
+    private val props: AIChatClientProperties
+) : AIChatClient {
 
-    @Value("\${ai-chat.client.timeoutMs:0}") private val timeoutMs: Long,
-    @Value("\${ai-chat.client.retry.count:0}") retryCount: Int,
-    @Value("\${ai-chat.client.retry.repeatDelayInSec:30}") retryRepeatDelayInSec: Long
-) {
-    private val client = DslWebClient(
-        webClient = builder.clone().build(),
-        retry = Retry(retryCount, retryRepeatDelayInSec)
-    )
-
-    suspend fun sendMessage(request: AskDto): String? {
-        val url = props.url.replace("{threadUid}", request.threadUid)
+    override suspend fun sendMessage(request: AskDto): String? {
+        val url = props.baseUrl.replace("{threadUid}", request.threadUid)
 
         val model = props.modelSettings
         val modelSettings = ModelSettingsDto(
@@ -43,36 +33,9 @@ class AiChatClientImpl(
             attachments = null
         )
 
-        return client.post<String> {
+        return dslClient.post<String> {
             path = url
             this.body = body
         }
     }
 }
-
-package ru.sber.poirot.ai.chat.configs
-
-/**
- * Настройки клиента для обращения к агенту анализа продуктовых уязвимостей.
- * Подтягиваются из application.yml
- */
-data class AIChatClientProperties(
-    var baseUrl: String = "",
-    var timeoutMs: Long = 0,
-    var retry: RetryProperties = RetryProperties(),
-    var modelSettings: ModelSettings = ModelSettings()
-) {
-    data class RetryProperties(
-        var count: Int = 3,
-        var delayInSec: Long = 5
-    )
-
-    data class ModelSettings(
-        var maxTokens: Int = 1024,
-        var model: String = "GigaChat-2-Max",
-        var repetitionPenalty: Double = 1.0,
-        var temperature: Double = 1.0,
-        var topP: Double = 0.5
-    )
-}
-
