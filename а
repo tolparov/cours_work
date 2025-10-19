@@ -50,17 +50,23 @@ class AiChatClientImpl(
     }
 }
 
-package ru.sber.poirot.ai.chat.config
+package ru.sber.poirot.ai.chat.configs
 
-import org.springframework.boot.context.properties.ConfigurationProperties
-import org.springframework.context.annotation.Configuration
-
-@Configuration
-@ConfigurationProperties(prefix = "ai-chat.agent")
-data class AiChatProperties(
-    var url: String = "",
+/**
+ * Настройки клиента для обращения к агенту анализа продуктовых уязвимостей.
+ * Подтягиваются из application.yml
+ */
+data class AIChatClientProperties(
+    var baseUrl: String = "",
+    var timeoutMs: Long = 0,
+    var retry: RetryProperties = RetryProperties(),
     var modelSettings: ModelSettings = ModelSettings()
 ) {
+    data class RetryProperties(
+        var count: Int = 3,
+        var delayInSec: Long = 5
+    )
+
     data class ModelSettings(
         var maxTokens: Int = 1024,
         var model: String = "GigaChat-2-Max",
@@ -69,3 +75,4 @@ data class AiChatProperties(
         var topP: Double = 0.5
     )
 }
+
