@@ -1,3 +1,112 @@
+package ru.sber.poirot.ai.chat.manager
+
+import org.springframework.boot.context.properties.ConfigurationProperties
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.stereotype.Service
+import org.springframework.web.reactive.function.client.WebClient
+import ru.sber.poirot.webclient.dsl.DslWebClient
+import ru.sber.poirot.webclient.dsl.post
+import ru.sber.utils.Retry
+
+/**
+ * Менеджер для общения с AI Chat агентом.
+ * Отвечает за построение запроса, отправку и возврат ответа.
+ */
+@Service
+class AIChatManager(
+    private val webClient: DslWebClient,
+    private val props: AIChatManagerProperties
+) {
+
+    /**
+     * Отправка сообщения в AI Chat.
+     * Формирует тело запроса на основе параметров из конфига и переданного текста.
+     */
+    suspend fun ask(
+        threadUid: String,
+        message: String
+    ): String? {
+        val url = props.baseUrl.replace("{threadUid}", threadUid)
+
+        val request = AiAgentRequest(
+            message = message,
+            modelSettings = ModelSettingsDto(
+                max_tokens = props.modelSettings.maxTokens,
+                model = props.modelSettings.model,
+                repetition_penalty = props.modelSettings.repetitionPenalty,
+                temperature = props.modelSettings.temperature,
+                top_p = props.modelSettings.topP
+            ),
+            attachments = null
+        )
+
+        return webClient.post<String> {
+            path = url
+            body = request
+        }
+    }
+}
+
+@Configuration
+class AIChatManagerConfig(
+    private val webBuilder: WebClient.Builder
+) {
+    @Bean
+    @ConfigurationProperties(prefix = "ai-chat.client")
+    fun aiChatManagerProperties() = AIChatManagerProperties()
+
+    @Bean
+    fun aiChatWebClient(props: AIChatManagerProperties): DslWebClient =
+        DslWebClient(
+            webClient = webBuilder.clone().baseUrl(props.baseUrl).build(),
+            retry = Retry(props.retry.count, props.retry.delayInSec)
+        )
+}
+
+/**
+ * Конфигурационные параметры для AI Chat клиента.
+ * Загружаются из application.yml по префиксу `ai-chat.client`.
+ */
+data class AIChatManagerProperties(
+    var baseUrl: String = "",
+    var timeoutMs: Long = 5000,
+    var retry: RetryProperties = RetryProperties(),
+    var modelSettings: ModelSettings = ModelSettings()
+) {
+    data class RetryProperties(
+        var count: Int = 3,
+        var delayInSec: Long = 5
+    )
+
+    data class ModelSettings(
+        var maxTokens: Int = 1024,
+        var model: String = "GigaChat-2-Max",
+        var repetitionPenalty: Double = 1.0,
+        var temperature: Double = 1.0,
+        var topP: Double = 0.5
+    )
+}
+
+/**
+ * DTO для запроса к AI Chat API.
+ */
+data class AiAgentRequest(
+    val message: String,
+    val modelSettings: ModelSettingsDto,
+    val attachments: List<Any>? = null
+)
+
+/**
+ * DTO настроек модели.
+ */
+data class ModelSettingsDto(
+    val max_tokens: Int,
+    val model: String,
+    val repetition_penalty: Double,
+    val temperature: Double,
+    val top_p: Double
+)
 package ru.sber.poirot.ai.chat.client.impl
 
 import org.springframework.stereotype.Service
