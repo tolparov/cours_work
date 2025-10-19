@@ -1,91 +1,71 @@
-suspend fun fetchUlDebts(inns: List<String>): List<UlDebtDto> =
-    findAll(
-        fields = listOf(
-            arrearsClientUl.inn,
-            arrearsAgreement.debtAmount,
-            arrearsAgreement.curDebtOverAmount,
-            arrearsAgreement.curPercOverAmount,
-            arrearsAgreement.curDebtOverDate,
-            arrearsAgreement.curPercOverDate
-        ),
-        batch = true
-    ) join {
-        arrearsRoleLink.customerId `=` arrearsClientUl.customerId
-        arrearsAgreement.agreementId `=` arrearsRoleLink.agreementId
-    } where {
-        arrearsClientUl.inn `in` inns and
-                arrearsRoleLink.role `=` "Заемщик"
-    } convertTo {
-        val inn = nextField<String>()
-        val totalCurrentDebt = nextField<Double?>() ?: 0.0
-        val curDebtOver = nextField<Double?>() ?: 0.0
-        val curPercOver = nextField<Double?>() ?: 0.0
-        val curDebtOverDate = nextField<LocalDate?>()
-        val curPercOverDate = nextField<LocalDate?>()
+package ru.sber.poirot.ai.chat.client
 
-        UlDebtDto(
-            clientInn = inn,
-            totalCurrentDebt = totalCurrentDebt,
-            totalOverdueDebt = curDebtOver + curPercOver,
-            prncpOverdueDays = daysBetweenToday(curDebtOverDate),
-            intrstOverdueDays = daysBetweenToday(curPercOverDate)
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.stereotype.Service
+import org.springframework.web.reactive.function.client.WebClient
+import ru.sber.poirot.ai.chat.config.AiChatProperties
+import ru.sber.poirot.ai.chat.dto.AskDto
+import ru.sber.poirot.ai.chat.dto.agent.AiAgentRequest
+import ru.sber.poirot.ai.chat.dto.agent.ModelSettingsDto
+import ru.sber.poirot.webclient.dsl.DslWebClient
+import ru.sber.poirot.webclient.dsl.post
+import ru.sber.utils.Retry
+
+@Service
+class AiChatClientImpl(
+    builder: WebClient.Builder,
+    private val props: AiChatProperties,
+
+    @Value("\${ai-chat.client.timeoutMs:0}") private val timeoutMs: Long,
+    @Value("\${ai-chat.client.retry.count:0}") retryCount: Int,
+    @Value("\${ai-chat.client.retry.repeatDelayInSec:30}") retryRepeatDelayInSec: Long
+) {
+    private val client = DslWebClient(
+        webClient = builder.clone().build(),
+        retry = Retry(retryCount, retryRepeatDelayInSec)
+    )
+
+    suspend fun sendMessage(request: AskDto): String? {
+        val url = props.url.replace("{threadUid}", request.threadUid)
+
+        val model = props.modelSettings
+        val modelSettings = ModelSettingsDto(
+            max_tokens = model.maxTokens,
+            model = model.model,
+            repetition_penalty = model.repetitionPenalty,
+            temperature = model.temperature,
+            top_p = model.topP
         )
-    }
-suspend fun fetchFlDebts(fioDobs: List<String>): List<FlDebtDto> {
-    return fioDobs.flatMap { fioDob ->
-        val parts = fioDob.split("|")
-        if (parts.size !in 3..4) {
-            throw FrontException(INCORRECT_ROW_SIZE.description)
-        }
 
-        val lastName = parts[0]
-        val firstName = parts[1]
-        val middleName = parts.getOrNull(2)?.takeIf { it.isNotBlank() }
-        val birthDate = LocalDate.parse(parts.last(), DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+        val body = AiAgentRequest(
+            message = request.message,
+            modelSettings = modelSettings,
+            attachments = null
+        )
 
-        val clients = findAll(entity = arrearsClientFl, batch = false) fetchFields {
-            listOf(arrearsClientFl.customerId)
-        } where {
-            arrearsClientFl.lastName `=` lastName.inlined and
-                    arrearsClientFl.firstName `=` firstName.inlined and
-                    arrearsClientFl.birthDate `=` birthDate.inlined and
-                    (middleName?.let { arrearsClientFl.middleName `=` it.inlined }
-                        ?: arrearsClientFl.middleName.isNull())
-        }
-
-        clients.flatMap { client ->
-            findAll(
-                fields = listOf(
-                    arrearsAgreement.agreementId,
-                    arrearsAgreement.debtAmount,
-                    arrearsAgreement.curDebtOverAmount,
-                    arrearsAgreement.curPercOverAmount,
-                    arrearsAgreement.curDebtOverDate,
-                    arrearsAgreement.curPercOverDate
-                ),
-                batch = false
-            ) join {
-                arrearsRoleLink.customerId `=` client.customerId.inlined and
-                        arrearsAgreement.agreementId `=` arrearsRoleLink.agreementId
-            } where {
-                arrearsRoleLink.role `=` "Заемщик".inlined
-            } convertTo {
-                val agreementId = nextField<String>()
-                val totalCurrentDebt = nextField<Double?>() ?: 0.0
-                val curDebtOver = nextField<Double?>() ?: 0.0
-                val curPercOver = nextField<Double?>() ?: 0.0
-                val curDebtOverDate = nextField<LocalDate?>()
-                val curPercOverDate = nextField<LocalDate?>()
-
-                FlDebtDto(
-                    agreementId = agreementId,
-                    clientFioDob = fioDob,
-                    totalCurrentDebt = totalCurrentDebt,
-                    totalOverdueDebt = curDebtOver + curPercOver,
-                    prncpOverdueDays = daysBetweenToday(curDebtOverDate),
-                    intrstOverdueDays = daysBetweenToday(curPercOverDate)
-                )
-            }
+        return client.post<String> {
+            path = url
+            this.body = body
         }
     }
+}
+
+package ru.sber.poirot.ai.chat.config
+
+import org.springframework.boot.context.properties.ConfigurationProperties
+import org.springframework.context.annotation.Configuration
+
+@Configuration
+@ConfigurationProperties(prefix = "ai-chat.agent")
+data class AiChatProperties(
+    var url: String = "",
+    var modelSettings: ModelSettings = ModelSettings()
+) {
+    data class ModelSettings(
+        var maxTokens: Int = 1024,
+        var model: String = "GigaChat-2-Max",
+        var repetitionPenalty: Double = 1.0,
+        var temperature: Double = 1.0,
+        var topP: Double = 0.5
+    )
 }
