@@ -1,150 +1,308 @@
-package ru.sber.poirot.ai.chat.manager
+package ru.sber.poirot.audit.websocket
 
-import org.springframework.boot.context.properties.ConfigurationProperties
+import kotlinx.coroutines.reactor.mono
+import org.springframework.security.access.prepost.PreAuthorize
+import org.springframework.web.reactive.socket.*
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
+import ru.sber.parseJson
+import ru.sber.permissions.HAS_AUDIT_READ
+import ru.sber.poirot.audit.dao.Audit
+import ru.sber.poirot.audit.model.AuditEvent
+import ru.sber.poirot.audit.model.WebSocketError
+import ru.sber.toJson
+import ru.sber.utils.logger
+import java.time.Duration
+import java.util.concurrent.atomic.AtomicLong
+
+class AuditWebSocketHandler(
+    private val auditDao: Audit
+) : WebSocketHandler {
+
+    private val log = logger()
+
+    @PreAuthorize(HAS_AUDIT_READ)
+    override fun handle(session: WebSocketSession): Mono<Void> {
+        log.info("New WS connection: {}", session.id)
+        val lastSeen = AtomicLong(System.currentTimeMillis())
+
+        // Основная обработка входящих сообщений
+        val receiveFlux = session.receive()
+            .flatMap { msg ->
+                lastSeen.set(System.currentTimeMillis()) // обновляем при любом сообщении
+                try {
+                    val filter = msg.payloadAsText.parseJson<SubscriptionFilter>()
+
+                    val historical = mono {
+                        auditDao.filter(filter.dateFrom, filter.dateTo, filter.login)
+                    }.flatMapMany { Flux.fromIterable(it) }
+
+                    val live = Flux.create<AuditEvent> { sink ->
+                        BroadcastRegistry.register(session.id, filter, sink)
+                        sink.onDispose { BroadcastRegistry.unregister(session.id) }
+                    }
+
+                    Flux.concat(historical, live)
+                        .map { session.textMessage(it.toJson()) }
+                        .flatMap { session.send(Mono.just(it)) }
+                        .then()
+                } catch (e: Exception) {
+                    val errorMsg = WebSocketError("Некорректные данные: ${e.message}")
+                    session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
+                }
+            }.doFinally {
+                log.info("Closing WS connection: {}", session.id)
+                BroadcastRegistry.unregister(session.id)
+            }
+        // Heartbeat: только отправка ping + проверка таймаута
+        val heartbeatFlux = Flux.interval(Duration.ofSeconds(180))
+            .flatMap {
+                val now = System.currentTimeMillis()
+                if (now - lastSeen.get() >= 600_000) {
+                    log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
+                    BroadcastRegistry.unregister(session.id)
+                    session.close().subscribe()
+                    Mono.empty<WebSocketMessage>()
+                } else {
+                    val ping = session.textMessage("""{"type":"ping"}""")
+                    session.send(Mono.just(ping))
+                        .doOnError { e ->
+                            log.warn("Failed to send ping to {}: {}", session.id, e.message)
+                            BroadcastRegistry.unregister(session.id)
+                            session.close().subscribe()
+                        }
+                        .subscribe()
+                    Mono.just(ping)
+                }
+            }
+
+        return Flux.merge(receiveFlux, heartbeatFlux).then()
+    }
+
+    fun broadcast(event: AuditEvent) {
+        BroadcastRegistry.publish(event)
+    }
+}package ru.sber.poirot.audit.dao
+
+import org.springframework.stereotype.Repository
+import ru.sber.poirot.audit.model.AuditEvent
+import ru.sber.poirot.audit.model.event
+import ru.sber.poirot.engine.dsl.Order.DESC
+import ru.sber.poirot.engine.dsl.findAll
+import ru.sber.utils.logger
+import ru.sber.utils.msFrom
+import java.lang.System.nanoTime
+import java.time.LocalDateTime
+
+@Repository
+class AuditDao : Audit {
+    private val log = logger()
+
+    override suspend fun filter(
+        dateFrom: LocalDateTime,
+        dateTo: LocalDateTime,
+        login: String?,
+        eventTypes: List<String>,
+        limit: Int,
+    ): List<AuditEvent> {
+        val start = nanoTime()
+        val events = findAll(
+            event,
+            orderBy = listOf(event.date),
+            order = DESC,
+            limit = limit
+        ) fetchFields {
+            allFields
+        } where {
+            if (login != null) userName `starts with` login
+            if (eventTypes.isNotEmpty()) event `in` eventTypes
+            date greaterThan dateFrom
+            date lessThanOrEqualTo dateTo
+        }
+        log.info("Found {} events in {} ms.", events.size, msFrom(start))
+        return events
+    }
+}package ru.sber.poirot.audit.websocket
+
+import ru.sber.poirot.audit.model.AuditEvent
+import reactor.core.publisher.FluxSink
+import java.util.concurrent.ConcurrentHashMap
+
+object BroadcastRegistry {
+
+    private val clients = ConcurrentHashMap<String, Pair<SubscriptionFilter, FluxSink<AuditEvent>>>()
+
+    fun register(sessionId: String, filter: SubscriptionFilter, sink: FluxSink<AuditEvent>) {
+        clients[sessionId] = filter to sink
+        sink.onDispose { clients.remove(sessionId) }
+    }
+
+    fun unregister(sessionId: String) {
+        clients.remove(sessionId)
+    }
+
+    fun publish(event: AuditEvent) {
+        clients.forEach { (sessionId, pair) ->
+            val (filter, sink) = pair
+            if (isEventMatchesFilter(event, filter)) {
+                if (!sink.isCancelled) {
+                    sink.next(event)
+                } else {
+                    clients.remove(sessionId)
+                }
+            }
+        }
+    }
+    private fun isEventMatchesFilter(event: AuditEvent, filter: SubscriptionFilter): Boolean {
+        return event.date.isAfter(filter.dateFrom) &&
+                event.date.isBefore(filter.dateTo) &&
+                (filter.login == null || event.userName.startsWith(filter.login))
+    }
+}package ru.sber.poirot.audit.websocket
+
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
-import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClient
-import ru.sber.poirot.webclient.dsl.DslWebClient
-import ru.sber.poirot.webclient.dsl.post
-import ru.sber.utils.Retry
-
-/**
- * Менеджер для общения с AI Chat агентом.
- * Отвечает за построение запроса, отправку и возврат ответа.
- */
-@Service
-class AIChatManager(
-    private val webClient: DslWebClient,
-    private val props: AIChatManagerProperties
-) {
-
-    /**
-     * Отправка сообщения в AI Chat.
-     * Формирует тело запроса на основе параметров из конфига и переданного текста.
-     */
-    suspend fun ask(
-        threadUid: String,
-        message: String
-    ): String? {
-        val url = props.baseUrl.replace("{threadUid}", threadUid)
-
-        val request = AiAgentRequest(
-            message = message,
-            modelSettings = ModelSettingsDto(
-                max_tokens = props.modelSettings.maxTokens,
-                model = props.modelSettings.model,
-                repetition_penalty = props.modelSettings.repetitionPenalty,
-                temperature = props.modelSettings.temperature,
-                top_p = props.modelSettings.topP
-            ),
-            attachments = null
-        )
-
-        return webClient.post<String> {
-            path = url
-            body = request
-        }
-    }
-}
+import org.springframework.web.reactive.HandlerMapping
+import org.springframework.web.reactive.handler.SimpleUrlHandlerMapping
+import org.springframework.web.reactive.socket.server.support.WebSocketHandlerAdapter
+import ru.sber.poirot.audit.dao.Audit
 
 @Configuration
-class AIChatManagerConfig(
-    private val webBuilder: WebClient.Builder
-) {
-    @Bean
-    @ConfigurationProperties(prefix = "ai-chat.client")
-    fun aiChatManagerProperties() = AIChatManagerProperties()
+class WebSocketConfig {
 
     @Bean
-    fun aiChatWebClient(props: AIChatManagerProperties): DslWebClient =
-        DslWebClient(
-            webClient = webBuilder.clone().baseUrl(props.baseUrl).build(),
-            retry = Retry(props.retry.count, props.retry.delayInSec)
-        )
-}
+    fun auditWebSocketHandler(auditDao: Audit): AuditWebSocketHandler = AuditWebSocketHandler(auditDao)
 
-/**
- * Конфигурационные параметры для AI Chat клиента.
- * Загружаются из application.yml по префиксу `ai-chat.client`.
- */
-data class AIChatManagerProperties(
-    var baseUrl: String = "",
-    var timeoutMs: Long = 5000,
-    var retry: RetryProperties = RetryProperties(),
-    var modelSettings: ModelSettings = ModelSettings()
-) {
-    data class RetryProperties(
-        var count: Int = 3,
-        var delayInSec: Long = 5
-    )
-
-    data class ModelSettings(
-        var maxTokens: Int = 1024,
-        var model: String = "GigaChat-2-Max",
-        var repetitionPenalty: Double = 1.0,
-        var temperature: Double = 1.0,
-        var topP: Double = 0.5
-    )
-}
-
-/**
- * DTO для запроса к AI Chat API.
- */
-data class AiAgentRequest(
-    val message: String,
-    val modelSettings: ModelSettingsDto,
-    val attachments: List<Any>? = null
-)
-
-/**
- * DTO настроек модели.
- */
-data class ModelSettingsDto(
-    val max_tokens: Int,
-    val model: String,
-    val repetition_penalty: Double,
-    val temperature: Double,
-    val top_p: Double
-)
-package ru.sber.poirot.ai.chat.client.impl
-
-import org.springframework.stereotype.Service
-import ru.sber.poirot.ai.chat.client.AIChatClient
-import ru.sber.poirot.ai.chat.configs.AIChatClientProperties
-import ru.sber.poirot.ai.chat.dto.AskDto
-import ru.sber.poirot.ai.chat.dto.agent.AiAgentRequest
-import ru.sber.poirot.ai.chat.dto.agent.ModelSettingsDto
-import ru.sber.poirot.webclient.dsl.DslWebClient
-import ru.sber.poirot.webclient.dsl.post
-
-@Service
-class AIChatClientImpl(
-    private val dslClient: DslWebClient,
-    private val props: AIChatClientProperties
-) : AIChatClient {
-
-    override suspend fun sendMessage(request: AskDto): String? {
-        val url = props.baseUrl.replace("{threadUid}", request.threadUid)
-
-        val model = props.modelSettings
-        val modelSettings = ModelSettingsDto(
-            max_tokens = model.maxTokens,
-            model = model.model,
-            repetition_penalty = model.repetitionPenalty,
-            temperature = model.temperature,
-            top_p = model.topP
-        )
-
-        val body = AiAgentRequest(
-            message = request.message,
-            modelSettings = modelSettings,
-            attachments = null
-        )
-
-        return dslClient.post<String> {
-            path = url
-            this.body = body
-        }
+    @Bean
+    fun webSocketHandlerMapping(auditWebSocketHandler: AuditWebSocketHandler): HandlerMapping {
+        val map = mapOf("/ws/audit" to auditWebSocketHandler)
+        return SimpleUrlHandlerMapping(map, -1)
     }
+
+    @Bean
+    fun handlerAdapter() = WebSocketHandlerAdapter()
+}package ru.sber.poirot.audit.model;
+
+import ru.sber.annotations.IdGenerator;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import java.time.LocalDateTime;
+
+import static ru.sber.poirot.engine.datasources.PoirotDatabaseNames.POIROT_USERS;
+
+@Entity
+@Table(name = "audit_events", catalog = POIROT_USERS)
+public class AuditEvent {
+    @Id
+    @IdGenerator(strategy = GenerationType.SEQUENCE, sequenceName = "audit_events_seq", allocationSize = 50)
+    public long id;
+    public String userName;
+    public String userIp;
+    public String event;
+    public String details;
+    public String url;
+    public String path;
+    public String headers;
+    public String pathVariables;
+    public String queryParams;
+    public String body;
+    public LocalDateTime date;
+
+    public long getId() {
+        return id;
+    }
+
+    @Override
+    public String toString() {
+        return "event='" + event + '\'' +
+                ", userName='" + userName + '\'' +
+                ", details='" + details + '\'' +
+                ", url='" + url + '\'' +
+                ", path='" + path + '\'' +
+                ", headers='" + headers + '\'' +
+                ", pathVariables='" + pathVariables + '\'' +
+                ", queryParams='" + queryParams + '\'' +
+                ", body='" + body + '\'' +
+                ", date='" + date + '\'' +
+                ", userIp='" + userIp + '\'';
+    }
+}package ru.sber.poirot.audit.model
+            
+import ru.sber.poirot.engine.dsl.ContextHolder
+import ru.sber.poirot.engine.dsl.Filter
+import ru.sber.poirot.engine.dsl.MetaModel
+import ru.sber.poirot.engine.dsl.metamodel.MetaModelOf
+import ru.sber.poirot.engine.dsl.metamodel.field
+import ru.sber.poirot.engine.dsl.metamodel.toField
+import java.time.LocalDateTime
+import java.util.Collections.emptyList
+
+class AuditEventMM(
+    private val currentMM: MetaModelOf<AuditEvent>,
+    private val currentFields: List<Any> = listOf(
+        "id".toField<Long>(currentMM),
+        "userName".toField<String>(currentMM),
+        "userIp".toField<String>(currentMM),
+        "event".toField<String>(currentMM),
+        "details".toField<String>(currentMM),
+        "url".toField<String>(currentMM),
+        "path".toField<String>(currentMM),
+        "headers".toField<String>(currentMM),
+        "pathVariables".toField<String>(currentMM),
+        "queryParams".toField<String>(currentMM),
+        "body".toField<String>(currentMM),
+        "date".toField<LocalDateTime>(currentMM),
+    ),
+    override var context: MutableList<Filter>
+) : MetaModel<AuditEvent> by currentMM, ContextHolder {
+    constructor(path: String, parent: MetaModel<*>?) : this(MetaModelOf(path, AuditEventMM::class.java, AuditEvent::class.java, parent), context = emptyList())
+
+    val id get() = field<Long>(currentFields[0], context)
+    val userName get() = field<String>(currentFields[1], context)
+    val userIp get() = field<String>(currentFields[2], context)
+    val event get() = field<String>(currentFields[3], context)
+    val details get() = field<String>(currentFields[4], context)
+    val url get() = field<String>(currentFields[5], context)
+    val path get() = field<String>(currentFields[6], context)
+    val headers get() = field<String>(currentFields[7], context)
+    val pathVariables get() = field<String>(currentFields[8], context)
+    val queryParams get() = field<String>(currentFields[9], context)
+    val body get() = field<String>(currentFields[10], context)
+    val date get() = field<LocalDateTime>(currentFields[11], context)
+
+    val allFields
+        get() = listOf(
+            id,
+            userName,
+            userIp,
+            event,
+            details,
+            url,
+            path,
+            headers,
+            pathVariables,
+            queryParams,
+            body,
+            date
+        )
+
+    override fun copy(context: MutableList<Filter>): AuditEventMM = AuditEventMM(currentMM, currentFields, context)
+    override fun equals(other: Any?): Boolean = this === other || currentMM == other
+    override fun hashCode(): Int = currentMM.hashCode()
+    override fun toString(): String = currentMM.toString()
 }
+
+val event = AuditEventMM("AuditEvent", null)
+val ContextHolder.event get() = event().copy(context = this.context)
+private fun event() = event
+package ru.sber.poirot.audit.model
+
+data class WebSocketError(val message: String)
+ надо сделать общие дто для передачи на фронт так уточню про объект у нас будет поля type, data, message
+11:24
+type может быт один из трех
+11:25
+{type: 'data', data: [{}{}{}{}]}, {type: 'ping'}, {type: error, message: 'string'}
