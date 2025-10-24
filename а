@@ -1,23 +1,150 @@
-val historical = mono {
-    auditDao.filter(filter.dateFrom, filter.dateTo, filter.login)
-}.flatMapMany { events ->
-    if (events.isNotEmpty()) {
-        // Отправляем все исторические события ОДНИМ сообщением
-        val dto = WsMessage.data(events)
-        val msg = session.textMessage(dto.toJson())
-        session.send(Mono.just(msg)).thenMany(Flux.empty())
-    } else {
-        Flux.empty()
+package ru.sber.poirot.audit.websocket
+
+import ru.sber.poirot.audit.model.AuditEvent
+import reactor.core.publisher.FluxSink
+import java.util.concurrent.ConcurrentHashMap
+
+object BroadcastRegistry {
+
+    private val clients = ConcurrentHashMap<String, Pair<SubscriptionFilter, FluxSink<AuditEvent>>>()
+
+    fun register(sessionId: String, filter: SubscriptionFilter, sink: FluxSink<AuditEvent>) {
+        clients[sessionId] = filter to sink
+        sink.onDispose { clients.remove(sessionId) }
+    }
+
+    fun unregister(sessionId: String) {
+        clients.remove(sessionId)
+    }
+
+    fun publish(event: AuditEvent) {
+        clients.forEach { (sessionId, pair) ->
+            val (filter, sink) = pair
+            if (isEventMatchesFilter(event, filter)) {
+                if (!sink.isCancelled) {
+                    sink.next(event)
+                } else {
+                    clients.remove(sessionId)
+                }
+            }
+        }
+    }
+    private fun isEventMatchesFilter(event: AuditEvent, filter: SubscriptionFilter): Boolean {
+        return event.date.isAfter(filter.dateFrom) &&
+                event.date.isBefore(filter.dateTo) &&
+                (filter.login == null || event.userName.startsWith(filter.login))
+    }
+}package ru.sber.poirot.audit.websocket
+
+import kotlinx.coroutines.reactor.mono
+import org.springframework.security.access.prepost.PreAuthorize
+import org.springframework.web.reactive.socket.*
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
+import ru.sber.parseJson
+import ru.sber.permissions.HAS_AUDIT_READ
+import ru.sber.poirot.audit.dao.Audit
+import ru.sber.poirot.audit.model.AuditEvent
+import ru.sber.poirot.audit.model.WsMessage
+import ru.sber.toJson
+import ru.sber.utils.logger
+import java.time.Duration
+import java.util.concurrent.atomic.AtomicLong
+
+class AuditWebSocketHandler(
+    private val auditDao: Audit
+) : WebSocketHandler {
+
+    private val log = logger()
+
+    @PreAuthorize(HAS_AUDIT_READ)
+    override fun handle(session: WebSocketSession): Mono<Void> {
+        log.info("New WS connection: {}", session.id)
+        val lastSeen = AtomicLong(System.currentTimeMillis())
+
+        // Основная обработка входящих сообщений
+        val receiveFlux = session.receive()
+            .flatMap { msg ->
+                lastSeen.set(System.currentTimeMillis()) // обновляем при любом сообщении
+                try {
+                    val filter = msg.payloadAsText.parseJson<SubscriptionFilter>()
+
+                    val historical = mono {
+                        auditDao.filter(filter.dateFrom, filter.dateTo, filter.login)
+                    }.flatMapMany { historicalEvents ->
+                        if (historicalEvents.isNotEmpty()) {
+                            val historicalMessage = WsMessage.data(historicalEvents).toJson()
+                            session.send(Mono.just(session.textMessage(historicalMessage)))
+                                .thenMany(Flux.empty<WebSocketMessage>())
+                        } else {
+                            Flux.empty<WebSocketMessage>()
+                        }
+                    }
+
+                    Flux.concat(
+                        historical,
+                        Flux.create<AuditEvent> { sink ->
+                            BroadcastRegistry.register(session.id, filter, sink)
+                            sink.onDispose { BroadcastRegistry.unregister(session.id) }
+                        }.map { event ->
+                            // live-события отправляем по одному
+                            WsMessage.data(listOf(event)).toJson()
+                        }.map { session.textMessage(it) }
+                            .flatMap { session.send(Mono.just(it)) }
+                    ).then()
+                } catch (e: Exception) {
+                    val errorMsg = WsMessage.error("Некорректные данные: ${e.message}")
+                    session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
+                }
+            }.doFinally {
+                log.info("Closing WS connection: {}", session.id)
+                BroadcastRegistry.unregister(session.id)
+            }
+        // Heartbeat: только отправка ping + проверка таймаута
+        val heartbeatFlux = Flux.interval(Duration.ofSeconds(180))
+            .flatMap {
+                val now = System.currentTimeMillis()
+                if (now - lastSeen.get() >= 600_000) {
+                    log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
+                    BroadcastRegistry.unregister(session.id)
+                    session.close().subscribe()
+                    Mono.empty<WebSocketMessage>()
+                } else {
+                    val ping = session.textMessage(WsMessage.ping().toJson())
+                    session.send(Mono.just(ping))
+                        .doOnError { e ->
+                            log.warn("Failed to send ping to {}: {}", session.id, e.message)
+                            BroadcastRegistry.unregister(session.id)
+                            session.close().subscribe()
+                        }
+                        .subscribe()
+                    Mono.just(ping)
+                }
+            }
+
+        return Flux.merge(receiveFlux, heartbeatFlux).then()
+    }
+
+    fun broadcast(event: AuditEvent) {
+        BroadcastRegistry.publish(event)
     }
 }
-Flux.concat(
-    historical,
-    Flux.create<AuditEvent> { sink ->
-        BroadcastRegistry.register(session.id, filter, sink)
-        sink.onDispose { BroadcastRegistry.unregister(session.id) }
-    }.map { event ->
-        // live-события отправляем по одному
-        WsMessage.data(listOf(event)).toJson()
-    }.map { session.textMessage(it) }
-     .flatMap { session.send(Mono.just(it)) }
-).then()
+
+{
+	"userName": "11072418",
+	"userIp": "192.168.1.101",
+	"event": "LOGIN",
+	"details": "User logged in",
+	"url": "/login",
+	"path": "/login",
+	"headers": "da",
+	"pathVariables": "ada",
+	"queryParams": "d",
+	"body": "dadada",
+	"date": "2025-10-24T12:19"
+} 'то запрос для store 
+
+а это для смаого аудита {
+	"dateFrom": "2025-10-24T11:30",
+	"dateTo": "2025-10-24T13:00"
+} как мне сделать чтоб записи при вставке в store сразу одавалиьс пользовотелею в реальном времени
