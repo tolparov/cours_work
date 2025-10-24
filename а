@@ -129,6 +129,41 @@ class AuditWebSocketHandler(
         BroadcastRegistry.publish(event)
     }
 }
+package ru.sber.poirot.audit.write
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers.Default
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import org.springframework.web.bind.annotation.PostMapping
+import org.springframework.web.bind.annotation.RequestBody
+import org.springframework.web.bind.annotation.RestController
+import ru.sber.poirot.audit.lastaccess.LastAccessStorage
+import ru.sber.poirot.audit.model.AuditEvent
+import ru.sber.poirot.audit.websocket.AuditWebSocketHandler
+import ru.sber.sql.persister.GraphPersister
+import ru.sber.sql.persister.async.BatchAsyncGraphPersister
+import ru.sber.utils.logger
+
+@RestController
+class AuditStoreController(
+    persister: GraphPersister,
+    private val lastAccessStorage: LastAccessStorage,
+    private val auditWebSocketHandler: AuditWebSocketHandler
+) {
+    private val batchPersister = BatchAsyncGraphPersister(persister).startInsertWorkers()
+    private val log = logger()
+    private val scope = CoroutineScope(SupervisorJob() + Default)
+
+    @PostMapping("/internal/store")
+    suspend fun audit(@RequestBody event: AuditEvent) {
+        log.info("Received {}", event)
+        batchPersister.insert(listOf(event))
+        scope.launch { lastAccessStorage.updateLastAccessBy(event) }
+
+        auditWebSocketHandler.broadcast(event)
+    }
+}
 
 {
 	"userName": "11072418",
