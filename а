@@ -1,4 +1,31 @@
-package ru.sber.poirot.audit.websocket
+24.10 17:20:02.567  INFO [Dispatcher-worker-1] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 98 ms.
+24.10 17:20:03.066  INFO [eactor-http-epoll-2] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 79b7af34
+24.10 17:21:26.365  INFO [poirot_users-dsl-03] ru.sber.poirot.audit.dao.AuditDao       : Found 1 events in 6 ms.
+24.10 17:24:38.824  INFO [eactor-http-epoll-2] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 42358456
+24.10 17:24:38.913  INFO [Dispatcher-worker-1] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 18 ms.
+24.10 17:24:38.933  INFO [eactor-http-epoll-2] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 42358456
+24.10 17:27:35.761  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 60e89762
+24.10 17:27:35.800  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 14 ms.
+24.10 17:27:35.841  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 60e89762
+24.10 17:27:49.814  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 43b42d39
+24.10 17:27:49.853  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 15 ms.
+24.10 17:27:49.866  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 43b42d39
+24.10 17:27:57.707  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 20dabaf1
+24.10 17:27:57.756  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 14 ms.
+24.10 17:27:57.767  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 20dabaf1
+24.10 17:28:11.250  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 133be4fd
+24.10 17:28:11.322  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 7 ms.
+24.10 17:28:11.331  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 133be4fd
+24.10 17:28:30.591  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 19258635
+24.10 17:28:30.668  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 12 ms.
+24.10 17:28:30.677  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 19258635
+24.10 17:28:34.664  INFO [eactor-http-epoll-1] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 77fa27f3
+24.10 17:28:34.748  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 10 ms.
+24.10 17:28:34.757  INFO [eactor-http-epoll-1] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 77fa27f3
+24.10 17:29:13.800  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : New WS connection: 872cbc4
+24.10 17:29:13.839  INFO [Dispatcher-worker-2] ru.sber.poirot.audit.dao.AuditDao       : Found 501 events in 7 ms.
+24.10 17:29:13.847  INFO [eactor-http-epoll-3] r.s.p.a.websocket.AuditWebSocketHandler : Closing WS connection: 872cbc4 
+начал тестировать с ui получает от него приходит запрос и сразу закрывается соединение package ru.sber.poirot.audit.websocket
 
 import kotlinx.coroutines.reactor.mono
 import org.springframework.security.access.prepost.PreAuthorize
