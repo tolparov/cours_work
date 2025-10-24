@@ -1,24 +1,23 @@
-package ru.sber.poirot.audit.websocket
-
-import ru.sber.poirot.audit.model.AuditEvent
-import com.fasterxml.jackson.annotation.JsonInclude
-import com.fasterxml.jackson.annotation.JsonProperty
-
-@JsonInclude(JsonInclude.Include.NON_NULL)
-data class WsMessage(
-    val type: Type,
-    val data: List<AuditEvent>? = null,
-    val message: String? = null
-) {
-    enum class Type {
-        @JsonProperty("data") DATA,
-        @JsonProperty("ping") PING,
-        @JsonProperty("error") ERROR
-    }
-
-    companion object {
-        fun data(events: List<AuditEvent>) = WsMessage(Type.DATA, data = events)
-        fun ping() = WsMessage(Type.PING)
-        fun error(msg: String) = WsMessage(Type.ERROR, message = msg)
+val historical = mono {
+    auditDao.filter(filter.dateFrom, filter.dateTo, filter.login)
+}.flatMapMany { events ->
+    if (events.isNotEmpty()) {
+        // Отправляем все исторические события ОДНИМ сообщением
+        val dto = WsMessage.data(events)
+        val msg = session.textMessage(dto.toJson())
+        session.send(Mono.just(msg)).thenMany(Flux.empty())
+    } else {
+        Flux.empty()
     }
 }
+Flux.concat(
+    historical,
+    Flux.create<AuditEvent> { sink ->
+        BroadcastRegistry.register(session.id, filter, sink)
+        sink.onDispose { BroadcastRegistry.unregister(session.id) }
+    }.map { event ->
+        // live-события отправляем по одному
+        WsMessage.data(listOf(event)).toJson()
+    }.map { session.textMessage(it) }
+     .flatMap { session.send(Mono.just(it)) }
+).then()
