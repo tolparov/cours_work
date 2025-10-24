@@ -1,41 +1,5 @@
 package ru.sber.poirot.audit.websocket
 
-import ru.sber.poirot.audit.model.AuditEvent
-import reactor.core.publisher.FluxSink
-import java.util.concurrent.ConcurrentHashMap
-
-object BroadcastRegistry {
-
-    private val clients = ConcurrentHashMap<String, Pair<SubscriptionFilter, FluxSink<AuditEvent>>>()
-
-    fun register(sessionId: String, filter: SubscriptionFilter, sink: FluxSink<AuditEvent>) {
-        clients[sessionId] = filter to sink
-        sink.onDispose { clients.remove(sessionId) }
-    }
-
-    fun unregister(sessionId: String) {
-        clients.remove(sessionId)
-    }
-
-    fun publish(event: AuditEvent) {
-        clients.forEach { (sessionId, pair) ->
-            val (filter, sink) = pair
-            if (isEventMatchesFilter(event, filter)) {
-                if (!sink.isCancelled) {
-                    sink.next(event)
-                } else {
-                    clients.remove(sessionId)
-                }
-            }
-        }
-    }
-    private fun isEventMatchesFilter(event: AuditEvent, filter: SubscriptionFilter): Boolean {
-        return event.date.isAfter(filter.dateFrom) &&
-                event.date.isBefore(filter.dateTo) &&
-                (filter.login == null || event.userName.startsWith(filter.login))
-    }
-}package ru.sber.poirot.audit.websocket
-
 import kotlinx.coroutines.reactor.mono
 import org.springframework.security.access.prepost.PreAuthorize
 import org.springframework.web.reactive.socket.*
@@ -65,7 +29,7 @@ class AuditWebSocketHandler(
         // Основная обработка входящих сообщений
         val receiveFlux = session.receive()
             .flatMap { msg ->
-                lastSeen.set(System.currentTimeMillis()) // обновляем при любом сообщении
+                lastSeen.set(System.currentTimeMillis())
                 try {
                     val filter = msg.payloadAsText.parseJson<SubscriptionFilter>()
 
@@ -81,17 +45,18 @@ class AuditWebSocketHandler(
                         }
                     }
 
+                    val live = Flux.create<AuditEvent> { sink ->
+                        BroadcastRegistry.register(session.id, filter, sink)
+                    }
+
+
                     Flux.concat(
                         historical,
-                        Flux.create<AuditEvent> { sink ->
-                            BroadcastRegistry.register(session.id, filter, sink)
-                            sink.onDispose { BroadcastRegistry.unregister(session.id) }
-                        }.map { event ->
-                            // live-события отправляем по одному
-                            WsMessage.data(listOf(event)).toJson()
-                        }.map { session.textMessage(it) }
-                            .flatMap { session.send(Mono.just(it)) }
-                    ).then()
+                        live.flatMap {  event ->
+                            val msg = WsMessage.data(listOf(event)).toJson()
+                            session.send(Mono.just(session.textMessage(msg)))
+                        }
+                    )
                 } catch (e: Exception) {
                     val errorMsg = WsMessage.error("Некорректные данные: ${e.message}")
                     session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
@@ -129,57 +94,3 @@ class AuditWebSocketHandler(
         BroadcastRegistry.publish(event)
     }
 }
-package ru.sber.poirot.audit.write
-
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers.Default
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import org.springframework.web.bind.annotation.PostMapping
-import org.springframework.web.bind.annotation.RequestBody
-import org.springframework.web.bind.annotation.RestController
-import ru.sber.poirot.audit.lastaccess.LastAccessStorage
-import ru.sber.poirot.audit.model.AuditEvent
-import ru.sber.poirot.audit.websocket.AuditWebSocketHandler
-import ru.sber.sql.persister.GraphPersister
-import ru.sber.sql.persister.async.BatchAsyncGraphPersister
-import ru.sber.utils.logger
-
-@RestController
-class AuditStoreController(
-    persister: GraphPersister,
-    private val lastAccessStorage: LastAccessStorage,
-    private val auditWebSocketHandler: AuditWebSocketHandler
-) {
-    private val batchPersister = BatchAsyncGraphPersister(persister).startInsertWorkers()
-    private val log = logger()
-    private val scope = CoroutineScope(SupervisorJob() + Default)
-
-    @PostMapping("/internal/store")
-    suspend fun audit(@RequestBody event: AuditEvent) {
-        log.info("Received {}", event)
-        batchPersister.insert(listOf(event))
-        scope.launch { lastAccessStorage.updateLastAccessBy(event) }
-
-        auditWebSocketHandler.broadcast(event)
-    }
-}
-
-{
-	"userName": "11072418",
-	"userIp": "192.168.1.101",
-	"event": "LOGIN",
-	"details": "User logged in",
-	"url": "/login",
-	"path": "/login",
-	"headers": "da",
-	"pathVariables": "ada",
-	"queryParams": "d",
-	"body": "dadada",
-	"date": "2025-10-24T12:19"
-} 'то запрос для store 
-
-а это для смаого аудита {
-	"dateFrom": "2025-10-24T11:30",
-	"dateTo": "2025-10-24T13:00"
-} как мне сделать чтоб записи при вставке в store сразу одавалиьс пользовотелею в реальном времени
