@@ -1,4 +1,53 @@
-witch (action.type) {
+import { closeSocket, openSocket, pong, pushAudit, setError } from '@/features/Audit/store/auditSlice';
+
+const preAuditMiddleware = () => {
+  let socket;
+
+  const onOpen = (store) => (event) => {
+    console.log('websocket open', event.target.url);
+    store.dispatch(openSocket());
+  };
+
+  const onClose = (store) => (event) => {
+    console.log('websocket close', event);
+    store.dispatch(closeSocket());
+  };
+
+  const onMessage = (store) => (event) => {
+    const payload = JSON.parse(event.data);
+    console.log('receiving server message', payload);
+
+    if (payload.type === 'ping') {
+      store.dispatch(pong());
+      return;
+    }
+
+    if (payload.type === 'error') {
+      store.dispatch(setError(payload.message));
+      return;
+    } else {
+      // store.dispatch(setError(''));
+    }
+
+    if (payload.type === 'data') {
+      console.log('pushing Audit', payload.data);
+      store.dispatch(pushAudit(payload.data));
+      return;
+    }
+  };
+
+  const onError = (store) => (event) => {
+    const payload = JSON.parse(event.data ? event.data : 'no error data');
+    console.log('receiving server error', payload, event);
+    store.dispatch(setError(payload));
+  };
+
+  return (store) => (next) => (action) => {
+    if (!action.type.includes('auditSlice')) {
+      return next(action);
+    }
+
+    switch (action.type) {
       case 'auditSlice/pong':
         console.log('ws pong');
         socket.send(JSON.stringify({ type: 'ping' }));
@@ -7,8 +56,7 @@ witch (action.type) {
       case 'auditSlice/connect':
         console.log('ws connecting', socket);
         if (!socket || socket.readyState !== WebSocket.OPEN)
-          socket = new WebSocket('ws://' + location.hostname + ':8080/poirot/ws/audit');
-          socket = new WebSocket('wss://' + location.hostname + 'poirot/audit/ws/audit');
+          socket = new WebSocket('wss://' + location.hostname + '/poirot/audit/ws/audit');
         socket.onopen = onOpen(store);
         socket.onclose = onClose(store);
         socket.onmessage = onMessage(store);
@@ -19,3 +67,21 @@ witch (action.type) {
         console.log('ws sending', action.payload);
         if (socket && socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify(action.payload));
+        }
+        break;
+      case 'auditSlice/clean':
+        console.log('ws cleaning', socket);
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          console.log('ws cleaning true');
+
+          socket.close();
+        }
+        break;
+      default:
+        console.log('ws the next action:', action);
+        next(action);
+    }
+  };
+};
+
+export const auditMiddleware = preAuditMiddleware();
