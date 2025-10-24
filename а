@@ -121,3 +121,14 @@ class AuditWebSocketHandler(
         BroadcastRegistry.publish(event)
     }
 }
+{dateFrom: "2025-10-23T17:30", dateTo: "2025-10-24T17:30", login: ""}
+dateFrom
+: 
+"2025-10-23T17:30"
+dateTo
+: 
+"2025-10-24T17:30"
+login
+: 
+""
+ почему так может быть 
