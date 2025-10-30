@@ -1,87 +1,167 @@
-import { closeSocket, openSocket, pong, pushAudit, setError } from '@/features/Audit/store/auditSlice';
+package ru.sber.poirot.ai.chat.configs
 
-const preAuditMiddleware = () => {
-  let socket;
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.context.properties.ConfigurationProperties
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.web.reactive.function.client.WebClient
+import ru.sber.poirot.webclient.dsl.DslWebClient
+import ru.sber.utils.Retry
 
-  const onOpen = (store) => (event) => {
-    console.log('websocket open', event.target.url);
-    store.dispatch(openSocket());
-  };
 
-  const onClose = (store) => (event) => {
-    console.log('websocket close', event);
-    store.dispatch(closeSocket());
-  };
+@Configuration
+class AiChatConfig(
+    private val webBuilder: WebClient.Builder,
+    @Value("\${aef-agent.service.url}")
+    private val aefAgentUrl: String,
+    @Value("\${ai-chat.client.retry.count:3}")
+    private val retryCount: Int,
+    @Value("\${ai-chat.client.retry.delayInSec:5}")
+    private val delayInSec: Long,
+) {
+    @Bean
+    fun retry(): Retry = Retry(retryCount, delayInSec)
 
-  const onMessage = (store) => (event) => {
-    const payload = JSON.parse(event.data);
-    console.log('receiving server message', payload);
+    @Bean
+    fun aiChatDslWebClient(properties: AiChatProperties): DslWebClient =
+        DslWebClient(
+            webClient = webBuilder.clone().baseUrl(properties.url).build(),
+            retry = retry()
+        )
+}
+package ru.sber.poirot.ai.chat.configs
 
-    if (payload.type === 'ping') {
-      store.dispatch(pong());
-      return;
-    }
+data class AiChatProperties(
+    var url: String = "",
+    var timeoutMs: Long = 0,
+    var retry: RetryProperties = RetryProperties(),
+    var modelSettings: ModelSettings = ModelSettings()
+) {
+    data class RetryProperties(
+        var count: Int = 3,
+        var delayInSec: Long = 5
+    )
 
-    if (payload.type === 'error') {
-      store.dispatch(setError(payload.message));
-      return;
-    } else {
-      // store.dispatch(setError(''));
-    }
+    data class ModelSettings(
+        var maxTokens: Int = 1024,
+        var model: String = "GigaChat-2-Max",
+        var repetitionPenalty: Double = 1.0,
+        var temperature: Double = 1.0,
+        var topP: Double = 0.5
+    )
+} package ru.sber.poirot.ai.chat.controller
 
-    if (payload.type === 'data') {
-      console.log('pushing Audit', payload.data);
-      store.dispatch(pushAudit(payload.data));
-      return;
-    }
-  };
+import org.springframework.security.access.prepost.PreAuthorize
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import ru.sber.poirot.audit.AuditClient;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import ru.sber.permissions.ai.HAS_PRODUCT_VULNERABILITY_AGENT
+import ru.sber.poirot.ai.chat.dto.AskDto
+import ru.sber.poirot.ai.chat.service.AiChat
 
-  const onError = (store) => (event) => {
-    const payload = JSON.parse(event.data ? event.data : 'no error data');
-    console.log('receiving server error', payload, event);
-    store.dispatch(setError(payload));
-  };
-
-  return (store) => (next) => (action) => {
-    if (!action.type.includes('auditSlice')) {
-      return next(action);
-    }
-
-    switch (action.type) {
-      case 'auditSlice/pong':
-        console.log('ws pong');
-        socket.send(JSON.stringify({ type: 'ping' }));
-        break;
-
-      case 'auditSlice/connect':
-        console.log('ws connecting', socket);
-        if (!socket || socket.readyState !== WebSocket.OPEN)
-          socket = new WebSocket('wss://' + location.hostname + '/poirot/audit/ws/audit');
-        socket.onopen = onOpen(store);
-        socket.onclose = onClose(store);
-        socket.onmessage = onMessage(store);
-        socket.onerror = onError(store);
-        break;
-
-      case 'auditSlice/setFilters':
-        console.log('ws sending', action.payload);
-        if (socket && socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify(action.payload));
+@RestController
+@RequestMapping("/api")
+class AiChatController(
+    private val auditClient: AuditClient,
+    private val aiChat: AiChat
+) {
+    @PostMapping("/ask")
+    @PreAuthorize(HAS_PRODUCT_VULNERABILITY_AGENT)
+    suspend fun ask(@RequestBody request: AskDto): String? =
+        auditClient.audit(event = "PRODUCT_VULNERABILITY_ASK") {
+            aiChat.ask(request)
         }
-        break;
-      case 'auditSlice/clean':
-        console.log('ws cleaning', socket);
-        if (socket && socket.readyState === WebSocket.OPEN) {
-          console.log('ws cleaning true');
+}
+package ru.sber.poirot.ai.chat.dto
 
-          socket.close();
+data class AgentResponseDto(
+    val threadUid: String,
+    val answer: String
+)package ru.sber.poirot.ai.chat.dto
+
+data class AiAgentRequestDto(
+    val threadUid: String?,
+    val message: String
+)package ru.sber.poirot.ai.chat.dto
+
+data class AskDto(
+    val threadUid: String,
+    val message: String
+)package ru.sber.poirot.ai.chat.service
+
+import com.fasterxml.jackson.databind.ObjectMapper
+import org.springframework.stereotype.Service
+import ru.sber.poirot.ai.chat.dto.AgentResponseDto
+import ru.sber.poirot.ai.chat.dto.AiAgentRequestDto
+import ru.sber.poirot.ai.chat.dto.AskDto
+import ru.sber.poirot.webclient.dsl.DslWebClient
+import ru.sber.poirot.webclient.dsl.post
+
+@Service
+class AiChatManager(
+    private val aiChatDslWebClient: DslWebClient,
+    private val objectMapper: ObjectMapper
+) : AiChat {
+
+    override suspend fun ask(request: AskDto): String? {
+        val request = AiAgentRequestDto(
+            threadUid = request.threadUid,
+            message = request.message
+        )
+
+        val response = aiChatDslWebClient.post<AgentResponseDto> {
+            path = "/api/v2/ask"
+            body = request
         }
-        break;
-      default:
-        console.log('ws the next action:', action);
-        next(action);
-    }
-  };
-};
 
-export const auditMiddleware = preAuditMiddleware();
+        return response?.answer?.let { rawAnswer ->
+            runCatching {
+                val jsonNode = objectMapper.readTree(rawAnswer)
+                jsonNode["overall_conclusion"]?.asText()
+            }.getOrNull()
+        }
+    }
+} 
+
+
+
+#include standard-microservice, transport-db
+
+spring:
+  cache.caffeine.spec: maximumSize=2000,expireAfterWrite=1m
+  codec.max-in-memory-size: ${gateway@spring.codec.max-in-memory-size}
+  web.legacy: true
+
+cache.useHeapCollections: true
+
+ai-chat:
+  agent:
+    url: "http://product-vulnerability-agent.ci10126887-aiss-aef-ift1.apps.a4x1lj15.k8s.delta.sbrf.ru:11000"
+    model-settings:
+      max-tokens: 1024
+      model: "GigaChat-2-Max"
+      repetition-penalty: 1.0
+      temperature: 1.0
+      top-p: 0.5
+
+  client:
+    timeoutMs: 5000
+    retry:
+      count: 3
+      repeatDelayInSec: 10
+
+transport:
+  defaultProcessName: AI_CHAT
+
+processTimeout: 60
+
+async.empty.enabled: true
+
+#var transport-db.schema: ai_agent я сюда хардкожу урл а должен через include тянуть #var aef-agent.host:product-vulnerability-agent.ci10126887-aiss-aef-ift1.apps.a4x1lj15.k8s.delta.sbrf.ru
+#var aef-agent.port:443, aef-agent.service.url: http://${this@aef-agent.host}:${this@aef-agent.virtual-port}
+
+#var aef-agent.host: localhost
+#var aef-agent.port: 80
+#var aef-agent.virtual-port: 11000
