@@ -1,1 +1,180 @@
+package ru.sber.poirot.cycle.operations.finder.impl
+
+import org.springframework.stereotype.Service
+import ru.sber.poirot.cache.cacheable
+import ru.sber.poirot.cycle.operations.events.EventLogger
+import ru.sber.poirot.cycle.operations.events.EventType
+import ru.sber.poirot.cycle.operations.events.EventType.*
+import ru.sber.poirot.cycle.operations.exception.CycleOperationErrorCode.EPK_NOT_FOUND
+import ru.sber.poirot.cycle.operations.exception.CycleOperationErrorCode.INCREMENT_FOR_QUARTER_NOT_LOADED
+import ru.sber.poirot.cycle.operations.exception.CycleOperationException
+import ru.sber.poirot.cycle.operations.finder.AggregatedEdge
+import ru.sber.poirot.cycle.operations.finder.CycleEdgesFetcher
+import ru.sber.poirot.cycle.operations.finder.CycleFinder
+import ru.sber.poirot.cycle.operations.finder.quarterEndDate
+import ru.sber.poirot.cycle.operations.rqrs.*
+import ru.sber.poirot.engine.dsl.convertTo
+import ru.sber.poirot.engine.dsl.existsAny
+import ru.sber.poirot.engine.dsl.findFirst
+import ru.sber.poirot.engine.metamodel.company
+import ru.sber.poirot.engine.metamodel.cycleOperationAggregation
+import ru.sber.toJson
+import java.time.LocalDate
+
+@Service
+class CycleFinderImpl(
+    private val eventLogger: EventLogger,
+    private val edgesFetcher: CycleEdgesFetcher
+) : CycleFinder {
+
+    // --- уже существующий метод ---
+    override suspend fun find(requestWrapper: RequestWrapper<FindCycleRq>): FindCycleRs =
+        runCatching {
+            with(requestWrapper) {
+                logContent(operId, requestId, MESSAGE_RECEIVED)
+                val response = tryFind(this)
+                response.logContent(operId, requestId, MESSAGE_SENT_RESPONSE)
+                response
+            }
+        }.onFailure {
+            with(requestWrapper) {
+                eventLogger.logException(operId, requestId, UNEXPECTED_EXCEPTION, it)
+            }
+        }.getOrThrow()
+
+    private suspend fun tryFind(requestWrapper: RequestWrapper<FindCycleRq>): FindCycleRs =
+        with(requestWrapper.request) {
+            when {
+                !existsAnyByQuarter(year, quarter) ->
+                    throw CycleOperationException(INCREMENT_FOR_QUARTER_NOT_LOADED, "квартал=$quarter, год=$year")
+                else -> cycleRs(edgesFetcher.fetch(fetchCompanyInnByEpkId(epkId), year, quarter))
+            }
+        }
+
+    // --- новый метод: возвращает список доступных годов и кварталов ---
+    override suspend fun findAvailablePeriods(requestWrapper: RequestWrapper<FindCycleRq>): FindAvailablePeriodsRs =
+        runCatching {
+            with(requestWrapper) {
+                logContent(operId, requestId, MESSAGE_RECEIVED)
+                val response = tryFindAvailablePeriods(this)
+                response.logContent(operId, requestId, MESSAGE_SENT_RESPONSE)
+                response
+            }
+        }.onFailure {
+            with(requestWrapper) {
+                eventLogger.logException(operId, requestId, UNEXPECTED_EXCEPTION, it)
+            }
+        }.getOrThrow()
+
+    private suspend fun tryFindAvailablePeriods(requestWrapper: RequestWrapper<FindCycleRq>): FindAvailablePeriodsRs =
+        with(requestWrapper.request) {
+            val inn = fetchCompanyInnByEpkId(epkId)
+            val dates = edgesFetcher.fetchAvailablePeriods(inn)
+
+            if (dates.isEmpty()) {
+                return FindAvailablePeriodsRs(foundCycleOperations = false, availablePeriods = emptyList())
+            }
+
+            val periods = dates.mapNotNull { date ->
+                date?.let { toCyclePeriod(it) }
+            }.distinct()
+                .sortedWith(compareByDescending<CyclePeriod> { it.year }.thenByDescending { it.quarter })
+
+            FindAvailablePeriodsRs(foundCycleOperations = true, availablePeriods = periods)
+        }
+
+    private fun toCyclePeriod(date: LocalDate): CyclePeriod {
+        val year = date.year
+        val quarter = when (date.monthValue) {
+            in 1..3 -> 1
+            in 4..6 -> 2
+            in 7..9 -> 3
+            in 10..12 -> 4
+            else -> throw IllegalArgumentException("Invalid month: ${date.monthValue}")
+        }
+        return CyclePeriod(year, quarter)
+    }
+
+    private suspend fun existsAnyByQuarter(year: Int, quarter: Int): Boolean =
+        cacheable("existsAnyByQuarter", year to quarter) {
+            existsAny(cycleOperationAggregation, batch = false) where {
+                actualDate `=` quarterEndDate(year, quarter)
+            }
+        }
+
+    private suspend fun fetchCompanyInnByEpkId(epkId: String): String =
+        (findFirst(
+            fields = listOf(company.inn),
+            batch = false
+        ) where {
+            company.customerId `=` epkId
+        }).convertTo { nextField() } ?: throw CycleOperationException(EPK_NOT_FOUND, "ЕПК ID=$epkId")
+
+    private fun cycleRs(edges: List<AggregatedEdge>): FindCycleRs {
+        if (edges.isEmpty()) return FindCycleRs(foundCycleOperations = false)
+        val common = edges[0]
+        val edgesByCycle = edges.groupBy { it.cycleTransactionId }
+
+        return FindCycleRs(
+            foundCycleOperations = true,
+            sumTransactionOut = common.sumTransactionOut,
+            sumTransactionIn = common.sumTransactionIn,
+            cycles = when {
+                edgesByCycle.size == 1 && edgesByCycle.keys.contains(null) -> emptyList()
+                else -> edgesByCycle.filteredCycles()
+            }
+        )
+    }
+
+    private fun Map<String?, List<AggregatedEdge>>.filteredCycles(): List<Cycle> =
+        cycles()
+            .sortedWith(Cycle.comparator)
+            .take(5)
+
+    private fun Map<String?, List<AggregatedEdge>>.cycles(): List<Cycle> =
+        map { (_, cycleEdges) ->
+            val cycleCommon = cycleEdges[0]
+            Cycle(
+                organizationInns = cycleEdges.flatMap {
+                    listOfNotNull(
+                        it.innOrganization1,
+                        it.innOrganization2,
+                        it.innOrganization3,
+                        it.innOrganization4,
+                        it.innOrganization5
+                    )
+                }.toSet(),
+                organizationHoldingFlag = cycleCommon.organizationHoldingFlag,
+                returnSum = cycleCommon.returnSum
+            )
+        }
+
+    private suspend fun Any.logContent(operId: String, requestId: String, eventType: EventType) {
+        eventLogger.logContent(operId, requestId, eventType, toJson())
+    }
+}
+
+data class FindAvailablePeriodsRs(
+    val foundCycleOperations: Boolean,
+    val availablePeriods: List<CyclePeriod>
+)
+
+data class CyclePeriod(
+    val year: Int,
+    val quarter: Int
+)
+
+@RestController
+class CycleOperationsController(private val finder: CycleFinder) {
+
+    @PostMapping("/findCycleOperations")
+    suspend fun findCycleOperations(
+        @RequestBody @Valid request: FindCycleRq
+    ): ResponseEntity<*> = ResponseEntity.ok().body(finder.find(request.wrap()))
+
+    @PostMapping("/findAvailablePeriods")
+    suspend fun findAvailablePeriods(
+        @RequestBody @Valid request: FindCycleRq
+    ): ResponseEntity<*> = ResponseEntity.ok().body(finder.findAvailablePeriods(request.wrap()))
+}
 
