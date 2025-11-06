@@ -1,122 +1,55 @@
-package ru.sber.poirot.cycle.operations.finder
-
-import jakarta.validation.Valid
-import org.springframework.http.ResponseEntity
-import org.springframework.web.bind.annotation.PostMapping
-import org.springframework.web.bind.annotation.RequestBody
-import org.springframework.web.bind.annotation.RestController
-import ru.sber.poirot.loops.model.FindAllCycleRq
-import ru.sber.poirot.loops.model.FindCycleRq
-import ru.sber.poirot.cycle.operations.rqrs.RequestWrapper.Companion.wrap
-
 @RestController
-class CycleOperationsController(private val finder: CycleFinder) {
-
-    @PostMapping("/findCycleOperations", "/internal/findCycleOperations")
-    suspend fun findCycleOperations(
-        @RequestBody
-        @Valid
-        request: FindCycleRq
-    ): ResponseEntity<*> = ResponseEntity.ok().body(finder.find(request.wrap()))
-
-    @PostMapping("/internal/findAvailablePeriods")
-    suspend fun findAvailablePeriods(
-        @RequestBody @Valid request: FindAllCycleRq
-    ): ResponseEntity<*> = ResponseEntity.ok().body(finder.findAvailablePeriods(request.wrap()))
-}
-package ru.sber.poirot.cycle.operations.client
-
-import org.springframework.context.annotation.Bean
-import org.springframework.context.annotation.Configuration
-import org.springframework.web.reactive.function.client.WebClient
-import ru.sber.poirot.webclient.dsl.DslWebClient
-import ru.sber.utils.Retry
-
-@Configuration
-class LoopsWebClientConfig(private val builder: WebClient.Builder) {
-
-    @Bean
-    fun loopsWebClient(): WebClient =
-        builder.clone().baseUrl("http://cycle-operations/").build()
-
-    @Bean
-    fun loopsDslWebClient(loopsWebClient: WebClient): DslWebClient = DslWebClient(
-        webClient = loopsWebClient,
-        retry = Retry(retryCount = 1, delayInSec = 10)
-    )
-}
-
-package ru.sber.poirot.cycle.operations.client
-
-import org.springframework.stereotype.Service
-import ru.sber.poirot.exception.FrontException
-import ru.sber.poirot.loops.model.FindAllCycleRq
-import ru.sber.poirot.loops.model.FindAvailablePeriodsRs
-import ru.sber.poirot.loops.model.FindCycleRq
-import ru.sber.poirot.loops.model.FindCycleRs
-import ru.sber.poirot.webclient.dsl.DslWebClient
-import ru.sber.poirot.webclient.dsl.post
-import ru.sber.poirot.cycle.operations.client.LoopsClientError.LOOPS_LOADER_NO_RESPONSE
-import ru.sber.utils.logger
-
-@Service
-class HttpLoopsClient(private val loopsDslWebClient: DslWebClient) : LoopsClient {
-
-    private val log = logger()
-
-    override suspend fun findCycleOperations(request: FindCycleRq): FindCycleRs {
-        log.info("Send findCycleOperations request: {}", request)
-
-        val response = loopsDslWebClient.post<FindCycleRs> {
-            path = "/internal/findCycleOperations"
-            body = request
-        } ?: throw FrontException(LOOPS_LOADER_NO_RESPONSE)
-
-        log.info("Got findCycleOperations response: {}", response)
-
-        return response
-    }
-
-    override suspend fun findAvailablePeriods(request: FindAllCycleRq): FindAvailablePeriodsRs {
-        log.info("Send findAvailablePeriods request: {}", request)
-
-        val response = loopsDslWebClient.post<FindAvailablePeriodsRs> {
-            path = "/internal/findAvailablePeriods"
-            body = request
-        } ?: throw FrontException(LOOPS_LOADER_NO_RESPONSE)
-
-        log.info("Got findAvailablePeriods response: {}", response)
-
-        return response
-    }
-} package ru.sber.poirot.dossier.loops
-
-class CycleOperationsImpl : CycleOperations {
-}
-
-package ru.sber.poirot.dossier.loops
-
-import io.swagger.v3.oas.annotations.Parameter
-import org.springframework.security.access.prepost.PreAuthorize
-import org.springframework.web.bind.annotation.GetMapping
-import org.springframework.web.bind.annotation.RequestMapping
-import org.springframework.web.bind.annotation.RestController
-import ru.sber.permissions.dossier.HAS_RING_OPERATIONS
-import ru.sber.poirot.audit.AuditClient
-import ru.sber.poirot.types.Inn
-
-@RestController
-@RequestMapping("/api")
-class CycleOperationsController (
+@RequestMapping("/api/cycle-operations")
+class CycleOperationsController(
     private val audit: AuditClient,
-    private val cycleOperations: CycleOperations,
+    private val cycleOperations: CycleOperations
 ) {
-    @GetMapping("/cycle-operations")
+
+    // --- 1. Получение списка доступных периодов ---
+    @GetMapping("/periods")
+    @PreAuthorize(HAS_RING_OPERATIONS)
+    suspend fun getAvailablePeriods(
+        @Parameter(description = "ИНН ЮЛ/ИП") inn: Inn
+    ) = audit.audit(
+        event = "DOSSIER_BY_LE_INN_PERIODS_FETCHED",
+        details = "inn: $inn"
+    ) {
+        cycleOperations.getAvailablePeriods(inn)
+    }
+
+    // --- 2. Получение данных за конкретный год и квартал ---
+    @GetMapping
     @PreAuthorize(HAS_RING_OPERATIONS)
     suspend fun getCycleOperations(
-        @Parameter(description = "ИНН ЮЛ\\ИП")
-        inn: Inn,
-    ): ? = audit.audit(event = "DOSSIER_BY_LE_INN_FETCHED", details = "inn: $inn") {
-        cycleOperations.getCycleOperations(inn)
+        @Parameter(description = "ИНН ЮЛ/ИП") inn: Inn,
+        @Parameter(description = "Год") year: Int,
+        @Parameter(description = "Квартал") quarter: Int
+    ) = audit.audit(
+        event = "DOSSIER_BY_LE_INN_FETCHED",
+        details = "inn: $inn, year: $year, quarter: $quarter"
+    ) {
+        cycleOperations.getCycleOperations(inn, year, quarter)
     }
-} вот где будут вызывать через проксю эндпоинты который я реализовал то есть сначала ui кидает запро с инн чтобы получить список год квартал пользователь выбирает год и квартал и 
+}
+
+interface CycleOperations {
+    suspend fun getAvailablePeriods(inn: Inn): List<CyclePeriod>
+    suspend fun getCycleOperations(inn: Inn, year: Int, quarter: Int): FindCycleRs
+}
+@Service
+class CycleOperationsImpl(
+    private val loopsClient: LoopsClient
+) : CycleOperations {
+
+    override suspend fun getAvailablePeriods(inn: Inn): List<CyclePeriod> {
+        val request = FindAllCycleRq(epkId = inn.value)
+        val response = loopsClient.findAvailablePeriods(request)
+        return response.availablePeriods
+    }
+
+    override suspend fun getCycleOperations(inn: Inn, year: Int, quarter: Int): FindCycleRs {
+        val request = FindCycleRq(epkId = inn.value, year = year, quarter = quarter)
+        return loopsClient.findCycleOperations(request)
+    }
+}
+
