@@ -1,55 +1,106 @@
-@RestController
-@RequestMapping("/api/cycle-operations")
-class CycleOperationsController(
-    private val audit: AuditClient,
-    private val cycleOperations: CycleOperations
+package ru.sber.poirot.notifications.config
+
+import org.springframework.context.annotation.Configuration
+import org.springframework.messaging.simp.config.MessageBrokerRegistry
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer
+
+@Configuration
+@EnableWebSocketMessageBroker
+class WebSocketConfig : WebSocketMessageBrokerConfigurer {
+
+    override fun registerStompEndpoints(registry: StompEndpointRegistry) {
+        registry.addEndpoint("/ws/notifications")
+            .setAllowedOriginPatterns("*")
+            .withSockJS()
+    }
+
+    override fun configureMessageBroker(registry: MessageBrokerRegistry) {
+        registry.enableSimpleBroker("/topic")
+        registry.setApplicationDestinationPrefixes("/app")
+    }
+}
+package ru.sber.poirot.notifications.websocket
+
+import org.springframework.messaging.handler.annotation.MessageMapping
+import org.springframework.messaging.handler.annotation.SendTo
+import org.springframework.stereotype.Controller
+import ru.sber.poirot.notifications.admin.AdminNotifications
+import ru.sber.poirot.notifications.admin.dto.FeedResponse
+
+@Controller
+class FeedWebSocketController(
+    private val adminNotifications: AdminNotifications
 ) {
 
-    // --- 1. Получение списка доступных периодов ---
-    @GetMapping("/periods")
-    @PreAuthorize(HAS_RING_OPERATIONS)
-    suspend fun getAvailablePeriods(
-        @Parameter(description = "ИНН ЮЛ/ИП") inn: Inn
-    ) = audit.audit(
-        event = "DOSSIER_BY_LE_INN_PERIODS_FETCHED",
-        details = "inn: $inn"
-    ) {
-        cycleOperations.getAvailablePeriods(inn)
+    /**
+     * Клиент при подключении отправляет /app/feed/init
+     * Сервер возвращает текущий список уведомлений
+     */
+    @MessageMapping("/feed/init")
+    @SendTo("/topic/feed")
+    suspend fun initFeed(): List<FeedResponse> {
+        return adminNotifications.feed()
+    }
+}package ru.sber.poirot.notifications.websocket
+
+import org.springframework.messaging.simp.SimpMessagingTemplate
+import org.springframework.stereotype.Service
+import ru.sber.poirot.notifications.admin.dto.FeedResponse
+
+@Service
+class FeedBroadcaster(
+    private val simpMessagingTemplate: SimpMessagingTemplate
+) {
+    fun broadcast(feed: List<FeedResponse>) {
+        simpMessagingTemplate.convertAndSend("/topic/feed", feed)
     }
 
-    // --- 2. Получение данных за конкретный год и квартал ---
-    @GetMapping
-    @PreAuthorize(HAS_RING_OPERATIONS)
-    suspend fun getCycleOperations(
-        @Parameter(description = "ИНН ЮЛ/ИП") inn: Inn,
-        @Parameter(description = "Год") year: Int,
-        @Parameter(description = "Квартал") quarter: Int
-    ) = audit.audit(
-        event = "DOSSIER_BY_LE_INN_FETCHED",
-        details = "inn: $inn, year: $year, quarter: $quarter"
-    ) {
-        cycleOperations.getCycleOperations(inn, year, quarter)
+    fun broadcastSingle(feed: FeedResponse) {
+        broadcast(listOf(feed))
     }
-}
-
-interface CycleOperations {
-    suspend fun getAvailablePeriods(inn: Inn): List<CyclePeriod>
-    suspend fun getCycleOperations(inn: Inn, year: Int, quarter: Int): FindCycleRs
 }
 @Service
-class CycleOperationsImpl(
-    private val loopsClient: LoopsClient
-) : CycleOperations {
+class AdminNotificationsImpl(
+    private val adminNotificationsDao: AdminNotificationsDao,
+    private val rolesDao: RolesDao,
+    private val currentUser: CurrentUser,
+    private val feedBroadcaster: FeedBroadcaster
+) : AdminNotifications {
 
-    override suspend fun getAvailablePeriods(inn: Inn): List<CyclePeriod> {
-        val request = FindAllCycleRq(epkId = inn.value)
-        val response = loopsClient.findAvailablePeriods(request)
-        return response.availablePeriods
+    override suspend fun create(request: CreateRequest): NotificationResponse {
+        val newRoleIds = chooseRoleIds(request.roleIds)
+        val notification = request.adminNotification(currentUser.userName(), newRoleIds)
+
+        adminNotificationsDao.insert(notification)
+        val response = notification.notificationResponse()
+
+        // 💥 Пушим свежую запись всем, у кого открыто feed-окно
+        feedBroadcaster.broadcastSingle(notification.toFeedResponse())
+
+        return response
     }
 
-    override suspend fun getCycleOperations(inn: Inn, year: Int, quarter: Int): FindCycleRs {
-        val request = FindCycleRq(epkId = inn.value, year = year, quarter = quarter)
-        return loopsClient.findCycleOperations(request)
+    override suspend fun update(request: UpdateRequest) {
+        if (!adminNotificationsDao.existsNotArchivedWithId(request.id)) {
+            throw FrontException(NOTIFICATION_NOT_FOUND_OR_ARCHIVED)
+        }
+
+        val notification = request.adminNotification(chooseRoleIds(request.roleIds))
+        adminNotificationsDao.merge(notification)
+
+        // 💥 пушим обновление
+        feedBroadcaster.broadcastSingle(notification.toFeedResponse())
+    }
+
+    override suspend fun archive(id: Long) {
+        val notification = adminNotificationsDao.fetchById(id).apply { archive = true }
+        adminNotificationsDao.merge(notification)
+
+        // 💥 можно пушить актуальную ленту (3 последних)
+        feedBroadcaster.broadcast(adminNotificationsDao.feed(currentUser.rolesIds().toSet()).map { it.toFeedResponse() })
     }
 }
+
 
