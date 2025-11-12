@@ -20,8 +20,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 @Controller
 class FeedWebSocketController(
-    private val adminNotifications: AdminNotifications,
-    private val currentUser: CurrentUser
+    private val adminNotifications: AdminNotifications
 ) : WebSocketHandler {
 
     private val log = logger()
@@ -29,86 +28,77 @@ class FeedWebSocketController(
     override fun handle(session: WebSocketSession): Mono<Void> {
         log.info("New WS connection: {}", session.id)
         val lastSeen = AtomicLong(System.currentTimeMillis())
-        val userRolesMono = mono { currentUser.rolesIds().toSet() }
 
         // Обработка сообщений от клиента
-        val receiveFlux = userRolesMono.flatMapMany { userRolesIds ->
-            session.receive()
-                .flatMap { msg ->
-                    lastSeen.set(System.currentTimeMillis())
-                    val payload = msg.payloadAsText
+        val receiveFlux = session.receive()
+            .flatMap { msg ->
+                lastSeen.set(System.currentTimeMillis())
+                val payload = msg.payloadAsText
 
-                    try {
-                        val wsMessage = payload.parseJson<WsMessage>()
+                try {
+                    val wsMessage = payload.parseJson<WsMessage>()
 
-                        when (wsMessage.type) {
-                            WsMessage.Type.PING -> {
-                                log.debug("Received ping from {}", session.id)
-                                Mono.empty<Void>()
-                            }
-
-                            WsMessage.Type.SUBSCRIBE -> {
-                                // Отправляем начальные уведомления
-                                val initialFeed = mono { adminNotifications.feed() }
-                                    .flatMapMany { feed ->
-                                        Flux.fromIterable(feed)
-                                            .flatMap { item ->
-                                                val wsMsg = WsMessage.data(listOf(item))
-                                                session.send(Mono.just(session.textMessage(wsMsg.toJson())))
-                                            }
-                                    }
-
-                                // Регистрируем сессию для пуша новых уведомлений
-                                BroadcastRegistry.register(session.id, session)
-
-                                initialFeed
-                            }
-
-                            else -> {
-                                val err = WsMessage.error("Unknown WSMessage type: ${wsMessage.type}")
-                                session.send(Mono.just(session.textMessage(err.toJson()))).then()
-                            }
+                    when (wsMessage.type) {
+                        WsMessage.Type.PING -> {
+                            log.debug("Received ping from {}", session.id)
+                            Mono.empty<Void>()
                         }
-                    } catch (e: Exception) {
-                        log.error("WS processing error: {}", e.message)
-                        val errorMsg = WsMessage.error("Invalid WSMessage: ${e.message}")
-                        session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
+
+                        WsMessage.Type.SUBSCRIBE -> {
+                            val initialFeed = mono { adminNotifications.feed() }
+                                .flatMapMany { feed ->
+                                    Flux.fromIterable(feed)
+                                        .flatMap { item ->
+                                            val wsMsg = WsMessage.data(listOf(item))
+                                            session.send(Mono.just(session.textMessage(wsMsg.toJson())))
+                                        }
+                                }
+
+                            BroadcastRegistry.register(session.id, session)
+
+                            initialFeed
+                        }
+
+                        else -> {
+                            val err = WsMessage.error("Unknown WSMessage type: ${wsMessage.type}")
+                            session.send(Mono.just(session.textMessage(err.toJson()))).then()
+                        }
                     }
+                } catch (e: Exception) {
+                    log.error("WS processing error: {}", e.message)
+                    val errorMsg = WsMessage.error("Invalid WSMessage: ${e.message}")
+                    session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
                 }
-                .doFinally { signal ->
-                    log.info("Closing WS connection: {} by {}", session.id, signal)
+            }
+            .doFinally { signal ->
+                log.info("Closing WS connection: {} by {}", session.id, signal)
+                BroadcastRegistry.unregister(session.id)
+            }
+
+        val heartbeatFlux = heartbeat(lastSeen, session)
+
+        return Flux.merge(receiveFlux, heartbeatFlux).then()
+    }
+
+    fun heartbeat(lastSeen: AtomicLong, session: WebSocketSession): Flux<WebSocketMessage> =
+        Flux.interval(Duration.ofSeconds(180))
+            .flatMap {
+                val now = System.currentTimeMillis()
+                if (now - lastSeen.get() >= 600_000) {
+                    log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
                     BroadcastRegistry.unregister(session.id)
+                    session.close().subscribe()
+                    Mono.empty<WebSocketMessage>()
+                } else {
+                    val ping = session.textMessage(WsMessage.ping().toJson())
+                    session.send(Mono.just(ping))
+                        .doOnError { e ->
+                            log.warn("Failed to send ping to {}: {}", session.id, e.message)
+                            BroadcastRegistry.unregister(session.id)
+                            session.close().subscribe()
+                        }
+                        .subscribe()
+                    Mono.just(ping)
                 }
-
-            val heartbeatFlux = heartbeat(lastSeen, session)
-
-            return Flux.merge(receiveFlux, heartbeatFlux).then()
-        }
-
-        fun heartbeat(lastSeen: AtomicLong, session: WebSocketSession): Flux<WebSocketMessage> =
-            Flux.interval(Duration.ofSeconds(180))
-                .flatMap {
-                    val now = System.currentTimeMillis()
-                    if (now - lastSeen.get() >= 600_000) {
-                        log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
-                        BroadcastRegistry.unregister(session.id)
-                        session.close().subscribe()
-                        Mono.empty<WebSocketMessage>()
-                    } else {
-                        val ping = session.textMessage(WsMessage.ping().toJson())
-                        session.send(Mono.just(ping))
-                            .doOnError { e ->
-                                log.warn("Failed to send ping to {}: {}", session.id, e.message)
-                                BroadcastRegistry.unregister(session.id)
-                                session.close().subscribe()
-                            }
-                            .subscribe()
-                        Mono.just(ping)
-                    }
-                }
-
-        fun broadcast(event: List<FeedResponse>) {
-            BroadcastRegistry.publish(event)
-        }
-    }Cannot infer type for this parameter. Specify it explicitly.
-Not enough information to infer type argument for 'R'.
+            }
+}
