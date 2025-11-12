@@ -32,202 +32,83 @@ class FeedWebSocketController(
         val userRolesMono = mono { currentUser.rolesIds().toSet() }
 
         // Обработка сообщений от клиента
-        val receiveFlux = session.receive()
-            .flatMap { msg ->
-                lastSeen.set(System.currentTimeMillis())
-                val payload = msg.payloadAsText
+        val receiveFlux = userRolesMono.flatMapMany { userRolesIds ->
+            session.receive()
+                .flatMap { msg ->
+                    lastSeen.set(System.currentTimeMillis())
+                    val payload = msg.payloadAsText
 
-                try {
-                    val wsMessage = payload.parseJson<WsMessage>()
+                    try {
+                        val wsMessage = payload.parseJson<WsMessage>()
 
-                    when (wsMessage.type) {
-                        WsMessage.Type.PING -> {
-                            log.debug("Received ping from {}", session.id)
-                            Mono.empty<Void>()
+                        when (wsMessage.type) {
+                            WsMessage.Type.PING -> {
+                                log.debug("Received ping from {}", session.id)
+                                Mono.empty<Void>()
+                            }
+
+                            WsMessage.Type.SUBSCRIBE -> {
+                                // Отправляем начальные уведомления
+                                val initialFeed = mono { adminNotifications.feed() }
+                                    .flatMapMany { feed ->
+                                        Flux.fromIterable(feed)
+                                            .flatMap { item ->
+                                                val wsMsg = WsMessage.data(listOf(item))
+                                                session.send(Mono.just(session.textMessage(wsMsg.toJson())))
+                                            }
+                                    }
+
+                                // Регистрируем сессию для пуша новых уведомлений
+                                BroadcastRegistry.register(session.id, session)
+
+                                initialFeed
+                            }
+
+                            else -> {
+                                val err = WsMessage.error("Unknown WSMessage type: ${wsMessage.type}")
+                                session.send(Mono.just(session.textMessage(err.toJson()))).then()
+                            }
                         }
-
-                        WsMessage.Type.SUBSCRIBE -> {
-                            // Отправляем начальные уведомления
-                            val initialFeed = mono { adminNotifications.feed() }
-                                .flatMapMany { feed ->
-                                    Flux.fromIterable(feed)
-                                        .flatMap { item ->
-                                            val wsMsg = WsMessage.data(listOf(item))
-                                            session.send(Mono.just(session.textMessage(wsMsg.toJson())))
-                                        }
-                                }
-
-                            // Регистрируем сессию для пуша новых уведомлений
-                            BroadcastRegistry.register(session.id, session)
-
-                            initialFeed
-                        }
-
-                        else -> {
-                            val err = WsMessage.error("Unknown WSMessage type: ${wsMessage.type}")
-                            session.send(Mono.just(session.textMessage(err.toJson()))).then()
-                        }
+                    } catch (e: Exception) {
+                        log.error("WS processing error: {}", e.message)
+                        val errorMsg = WsMessage.error("Invalid WSMessage: ${e.message}")
+                        session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
                     }
-                } catch (e: Exception) {
-                    log.error("WS processing error: {}", e.message)
-                    val errorMsg = WsMessage.error("Invalid WSMessage: ${e.message}")
-                    session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
                 }
-            }
-            .doFinally { signal ->
-                log.info("Closing WS connection: {} by {}", session.id, signal)
-                BroadcastRegistry.unregister(session.id)
-            }
-
-        val heartbeatFlux = heartbeat(lastSeen, session)
-
-        return Flux.merge(receiveFlux, heartbeatFlux).then()
-    }
-
-    fun heartbeat(lastSeen: AtomicLong, session: WebSocketSession): Flux<WebSocketMessage> =
-        Flux.interval(Duration.ofSeconds(180))
-            .flatMap {
-                val now = System.currentTimeMillis()
-                if (now - lastSeen.get() >= 600_000) {
-                    log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
+                .doFinally { signal ->
+                    log.info("Closing WS connection: {} by {}", session.id, signal)
                     BroadcastRegistry.unregister(session.id)
-                    session.close().subscribe()
-                    Mono.empty<WebSocketMessage>()
-                } else {
-                    val ping = session.textMessage(WsMessage.ping().toJson())
-                    session.send(Mono.just(ping))
-                        .doOnError { e ->
-                            log.warn("Failed to send ping to {}: {}", session.id, e.message)
-                            BroadcastRegistry.unregister(session.id)
-                            session.close().subscribe()
-                        }
-                        .subscribe()
-                    Mono.just(ping)
                 }
-            }
 
-    fun broadcast(event: List<FeedResponse>) {
-        BroadcastRegistry.publish(event)
-    }
-}package ru.sber.poirot.notifications.websocket
+            val heartbeatFlux = heartbeat(lastSeen, session)
 
-import org.springframework.context.annotation.Bean
-import org.springframework.context.annotation.Configuration
-import org.springframework.messaging.simp.config.MessageBrokerRegistry
-import org.springframework.web.reactive.HandlerMapping
-import org.springframework.web.reactive.handler.SimpleUrlHandlerMapping
-import org.springframework.web.reactive.socket.server.support.WebSocketHandlerAdapter
-import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker
-import org.springframework.web.socket.config.annotation.StompEndpointRegistry
-import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer
-import ru.sber.poirot.CurrentUser
-import ru.sber.poirot.notifications.admin.AdminNotifications
-
-@Configuration
-class WebSocketConfig {
-
-    @Bean
-    fun auditWebSocketHandler(
-        adminNotifications: AdminNotifications,
-        currentUser: CurrentUser
-    ): FeedWebSocketController = FeedWebSocketController(adminNotifications, currentUser)
-
-    @Bean
-    fun webSocketHandlerMapping(feedWebSocketController: FeedWebSocketController): HandlerMapping {
-        val map = mapOf("/ws/feed" to feedWebSocketController)
-        return SimpleUrlHandlerMapping(map, -1)
-    }
-
-    @Bean
-    fun handlerAdapter() = WebSocketHandlerAdapter()
-}package ru.sber.poirot.notifications.websocket
-
-import org.springframework.web.reactive.socket.WebSocketSession
-import reactor.core.publisher.FluxSink
-import reactor.core.publisher.Mono
-import ru.sber.poirot.notifications.admin.dto.FeedResponse
-import ru.sber.poirot.notifications.admin.dto.WsMessage
-import ru.sber.toJson
-import java.util.concurrent.ConcurrentHashMap
-
-object BroadcastRegistry {
-
-    private val clients = ConcurrentHashMap<String, WebSocketSession>()
-
-    fun register(sessionId: String, session: WebSocketSession) {
-        clients[sessionId] = session
-    }
-
-    fun unregister(sessionId: String) {
-        clients.remove(sessionId)
-    }
-
-    fun publish(feedResponses: List<FeedResponse>) {
-        val wsMsg = WsMessage.data(feedResponses).toJson()
-        clients.forEach { (_, session) ->
-            if (session.isOpen) {
-                session.send(Mono.just(session.textMessage(wsMsg))).subscribe()
-            }
-        }
-    }
-}
-package ru.sber.poirot.notifications.admin.impl
-
-import org.springframework.stereotype.Service
-import ru.sber.poirot.CurrentUser
-import ru.sber.poirot.exception.FrontException
-import ru.sber.poirot.notifications.admin.AdminNotifications
-import ru.sber.poirot.notifications.admin.dto.*
-import ru.sber.poirot.notifications.common.error.NotificationErrorCode.NOTIFICATION_NOT_FOUND_OR_ARCHIVED
-import ru.sber.poirot.notifications.roles.RolesDao
-import ru.sber.poirot.notifications.websocket.BroadcastRegistry
-
-@Service
-class AdminNotificationsImpl(
-    private val adminNotificationsDao: AdminNotificationsDao,
-    private val rolesDao: RolesDao,
-    private val currentUser: CurrentUser,
-) : AdminNotifications {
-
-    override suspend fun create(request: CreateRequest): NotificationResponse {
-        val newRoleIds = chooseRoleIds(request.roleIds)
-        val notification = request.adminNotification(currentUser.userName(), newRoleIds)
-        adminNotificationsDao.insert(notification)
-
-        BroadcastRegistry.publish(listOf(notification.toFeedResponse()))
-
-        return notification.notificationResponse()
-    }
-
-    override suspend fun update(request: UpdateRequest) {
-        if (!adminNotificationsDao.existsNotArchivedWithId(request.id)) {
-            throw FrontException(NOTIFICATION_NOT_FOUND_OR_ARCHIVED)
+            return Flux.merge(receiveFlux, heartbeatFlux).then()
         }
 
-        val notification = request.adminNotification(chooseRoleIds(request.roleIds))
-        adminNotificationsDao.merge(notification)
+        fun heartbeat(lastSeen: AtomicLong, session: WebSocketSession): Flux<WebSocketMessage> =
+            Flux.interval(Duration.ofSeconds(180))
+                .flatMap {
+                    val now = System.currentTimeMillis()
+                    if (now - lastSeen.get() >= 600_000) {
+                        log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
+                        BroadcastRegistry.unregister(session.id)
+                        session.close().subscribe()
+                        Mono.empty<WebSocketMessage>()
+                    } else {
+                        val ping = session.textMessage(WsMessage.ping().toJson())
+                        session.send(Mono.just(ping))
+                            .doOnError { e ->
+                                log.warn("Failed to send ping to {}: {}", session.id, e.message)
+                                BroadcastRegistry.unregister(session.id)
+                                session.close().subscribe()
+                            }
+                            .subscribe()
+                        Mono.just(ping)
+                    }
+                }
 
-        BroadcastRegistry.publish(listOf(notification.toFeedResponse()))
-    }
-
-    override suspend fun archive(id: Long) {
-        val notification = adminNotificationsDao.fetchById(id).apply { archive = true }
-        adminNotificationsDao.merge(notification)
-
-        BroadcastRegistry.publish(listOf(notification.toFeedResponse()))
-    }
-
-    override suspend fun feed(): List<FeedResponse> {
-        val userRoleIds = currentUser.rolesIds().toSet()
-
-        return adminNotificationsDao.feed(userRoleIds).map { it.toFeedResponse() }
-    }
-
-    override suspend fun fetchAll(): List<NotificationResponse> =
-        adminNotificationsDao.fetchAll().map { it.notificationResponse() }
-
-    private suspend fun chooseRoleIds(roleIds: List<Int>?): List<Int> = when {
-        roleIds.isNullOrEmpty() -> rolesDao.getAllRoleIds()
-        else -> roleIds
-    }
-}
+        fun broadcast(event: List<FeedResponse>) {
+            BroadcastRegistry.publish(event)
+        }
+    }Cannot infer type for this parameter. Specify it explicitly.
+Not enough information to infer type argument for 'R'.
