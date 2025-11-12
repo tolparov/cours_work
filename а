@@ -171,3 +171,63 @@ object BroadcastRegistry {
         }
     }
 }
+package ru.sber.poirot.notifications.admin.impl
+
+import org.springframework.stereotype.Service
+import ru.sber.poirot.CurrentUser
+import ru.sber.poirot.exception.FrontException
+import ru.sber.poirot.notifications.admin.AdminNotifications
+import ru.sber.poirot.notifications.admin.dto.*
+import ru.sber.poirot.notifications.common.error.NotificationErrorCode.NOTIFICATION_NOT_FOUND_OR_ARCHIVED
+import ru.sber.poirot.notifications.roles.RolesDao
+import ru.sber.poirot.notifications.websocket.BroadcastRegistry
+
+@Service
+class AdminNotificationsImpl(
+    private val adminNotificationsDao: AdminNotificationsDao,
+    private val rolesDao: RolesDao,
+    private val currentUser: CurrentUser,
+) : AdminNotifications {
+
+    override suspend fun create(request: CreateRequest): NotificationResponse {
+        val newRoleIds = chooseRoleIds(request.roleIds)
+        val notification = request.adminNotification(currentUser.userName(), newRoleIds)
+        adminNotificationsDao.insert(notification)
+
+        BroadcastRegistry.publish(listOf(notification.toFeedResponse()))
+
+        return notification.notificationResponse()
+    }
+
+    override suspend fun update(request: UpdateRequest) {
+        if (!adminNotificationsDao.existsNotArchivedWithId(request.id)) {
+            throw FrontException(NOTIFICATION_NOT_FOUND_OR_ARCHIVED)
+        }
+
+        val notification = request.adminNotification(chooseRoleIds(request.roleIds))
+        adminNotificationsDao.merge(notification)
+
+        BroadcastRegistry.publish(listOf(notification.toFeedResponse()))
+    }
+
+    override suspend fun archive(id: Long) {
+        val notification = adminNotificationsDao.fetchById(id).apply { archive = true }
+        adminNotificationsDao.merge(notification)
+
+        BroadcastRegistry.publish(listOf(notification.toFeedResponse()))
+    }
+
+    override suspend fun feed(): List<FeedResponse> {
+        val userRoleIds = currentUser.rolesIds().toSet()
+
+        return adminNotificationsDao.feed(userRoleIds).map { it.toFeedResponse() }
+    }
+
+    override suspend fun fetchAll(): List<NotificationResponse> =
+        adminNotificationsDao.fetchAll().map { it.notificationResponse() }
+
+    private suspend fun chooseRoleIds(roleIds: List<Int>?): List<Int> = when {
+        roleIds.isNullOrEmpty() -> rolesDao.getAllRoleIds()
+        else -> roleIds
+    }
+}
