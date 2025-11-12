@@ -1,2 +1,131 @@
-implementation("org.springframework.boot:spring-boot-starter-websocket")
-implementation("org.springframework:spring-messaging")
+package ru.sber.poirot.notifications.websocket
+
+import org.springframework.web.reactive.socket.WebSocketSession
+import reactor.core.publisher.Mono
+import java.util.concurrent.ConcurrentHashMap
+import ru.sber.poirot.notifications.admin.dto.FeedResponse
+import ru.sber.poirot.audit.model.WsMessage
+
+object BroadcastRegistry {
+
+    private val clients = ConcurrentHashMap<String, WebSocketSession>()
+
+    fun register(sessionId: String, session: WebSocketSession) {
+        clients[sessionId] = session
+    }
+
+    fun unregister(sessionId: String) {
+        clients.remove(sessionId)
+    }
+
+    fun publish(feedResponses: List<FeedResponse>) {
+        val wsMsg = WsMessage.data(feedResponses).toJson()
+        clients.forEach { (_, session) ->
+            if (session.isOpen) {
+                session.send(Mono.just(session.textMessage(wsMsg))).subscribe()
+            }
+        }
+    }
+}
+
+package ru.sber.poirot.notifications.websocket
+
+import kotlinx.coroutines.reactor.mono
+import org.springframework.web.reactive.socket.*
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
+import ru.sber.poirot.notifications.admin.AdminNotifications
+import ru.sber.poirot.notifications.admin.dto.FeedResponse
+import ru.sber.poirot.audit.model.WsMessage
+import java.util.concurrent.atomic.AtomicLong
+import java.time.Duration
+import ru.sber.utils.logger
+
+class AdminNotificationWebSocketHandler(
+    private val adminNotifications: AdminNotifications,
+    private val currentUserProvider: () -> Set<Int>
+) : WebSocketHandler {
+
+    private val log = logger()
+
+    override fun handle(session: WebSocketSession): Mono<Void> {
+        log.info("New WS connection: {}", session.id)
+        val lastSeen = AtomicLong(System.currentTimeMillis())
+        val userRoleIds = currentUserProvider()
+
+        // Обработка сообщений от клиента
+        val receiveFlux = session.receive()
+            .flatMap { msg ->
+                lastSeen.set(System.currentTimeMillis())
+                try {
+                    val wsMessage = msg.payloadAsText.parseJson<WsMessage>()
+
+                    when (wsMessage.type) {
+                        WsMessage.Type.PING -> {
+                            log.debug("Received ping from {}", session.id)
+                            Mono.empty<Void>()
+                        }
+
+                        WsMessage.Type.SUBSCRIBE -> {
+                            // Отправляем начальные уведомления
+                            val initialFeed = mono { adminNotifications.feed() }
+                                .flatMapMany { feed ->
+                                    Flux.fromIterable(feed)
+                                        .flatMap { item ->
+                                            val wsMsg = WsMessage.data(listOf(item))
+                                            session.send(Mono.just(session.textMessage(wsMsg.toJson())))
+                                        }
+                                }
+
+                            // Регистрируем сессию для пуша новых уведомлений
+                            BroadcastRegistry.register(session.id, session)
+
+                            initialFeed
+                        }
+
+                        else -> {
+                            val err = WsMessage.error("Unknown WSMessage type: ${wsMessage.type}")
+                            session.send(Mono.just(session.textMessage(err.toJson()))).then()
+                        }
+                    }
+                } catch (e: Exception) {
+                    log.error("WS processing error: {}", e.message)
+                    val errorMsg = WsMessage.error("Invalid WSMessage: ${e.message}")
+                    session.send(Mono.just(session.textMessage(errorMsg.toJson()))).then()
+                }
+            }
+            .doFinally { signal ->
+                log.info("Closing WS connection: {} by {}", session.id, signal)
+                BroadcastRegistry.unregister(session.id)
+            }
+
+        val heartbeatFlux = heartbeat(lastSeen, session)
+
+        return Flux.merge(receiveFlux, heartbeatFlux).then()
+    }
+
+    private fun heartbeat(lastSeen: AtomicLong, session: WebSocketSession): Flux<WebSocketMessage> =
+        Flux.interval(Duration.ofSeconds(30))
+            .flatMap {
+                val now = System.currentTimeMillis()
+                if (now - lastSeen.get() >= 600_000) { // 10 минут без ответа
+                    log.warn("Session {} did not respond to heartbeat. Closing.", session.id)
+                    BroadcastRegistry.unregister(session.id)
+                    session.close().subscribe()
+                    Mono.empty<WebSocketMessage>()
+                } else {
+                    val ping = WsMessage.ping().toJson()
+                    session.send(Mono.just(session.textMessage(ping))).subscribe()
+                    Mono.just(session.textMessage(ping))
+                }
+            }
+}
+override suspend fun create(request: CreateRequest): NotificationResponse {
+    val newRoleIds = chooseRoleIds(request.roleIds)
+    val notification = request.adminNotification(currentUser.userName(), newRoleIds)
+    adminNotificationsDao.insert(notification)
+
+    BroadcastRegistry.publish(listOf(notification.toFeedResponse())) // пушим WS
+
+    return notification.notificationResponse()
+}
