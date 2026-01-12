@@ -1,15 +1,12 @@
 package ru.sber.poirot.notifications.admin.dto
 
-import com.fasterxml.jackson.annotation.JsonIgnore
 import ru.sber.poirot.notifications.common.entity.AdminNotification
 
 data class FeedResponse(
     val id: Long,
     val type: String,
     val message: String,
-    @JsonIgnore
-    val archived: Boolean,
-    @JsonIgnore
+    val archived: Boolean = false,
     val roleIds: List<Int> = emptyList()
 )
 
@@ -21,7 +18,6 @@ fun AdminNotification.toFeedResponse(): FeedResponse =
         archived = archive,
         roleIds = mapping?.map { it.roleId } ?: emptyList()
     )
-
 
 package ru.sber.poirot.notifications.admin.dto
 
