@@ -5,10 +5,12 @@ import reactor.core.publisher.Mono
 import ru.sber.poirot.notifications.admin.dto.FeedResponse
 import ru.sber.poirot.notifications.admin.dto.WsMessage
 import ru.sber.toJson
+import ru.sber.utils.logger
 import java.util.concurrent.ConcurrentHashMap
 
 object BroadcastRegistry {
 
+    private val log = logger()
     private val clients = ConcurrentHashMap<String, ConnectedClient>()
 
     data class ConnectedClient(
@@ -24,45 +26,98 @@ object BroadcastRegistry {
         initialFeed: List<FeedResponse>
     ) {
         clients[sessionId] = ConnectedClient(session, roleIds, initialFeed.toMutableList())
+        log.info("Registered session: {}, total clients: {}", sessionId, clients.size)
     }
 
     fun unregister(sessionId: String) {
         clients.remove(sessionId)
+        log.info("Unregistered session: {}, remaining clients: {}", sessionId, clients.size)
     }
 
     fun publish(feedResponses: List<FeedResponse>) {
+        // 🟢 Очистка мертвых сессий перед broadcast
+        cleanupDeadSessions()
+
         feedResponses.forEach { feed ->
-            clients.forEach { (_, client) ->
-                if (!client.session.isOpen) return@forEach
-
-                val hasRole = client.roleIds.any { it in feed.roleIds }
-                val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
-
-                when {
-                    feed.archived -> {
-                        if (existingIndex != -1) {
-                            client.feed.removeAt(existingIndex)
-                            sendUpdate(client, listOf(feed))
-                        }
-                    }
-
-                    existingIndex == -1 && hasRole -> {
-                        client.feed.add(feed)
-                        sendUpdate(client, listOf(feed))
-                    }
-
-                    // 🔹 Обновление (update)
-                    existingIndex != -1 && hasRole -> {
-                        client.feed[existingIndex] = feed
-                        sendUpdate(client, listOf(feed))
-                    }
+            clients.forEach { (sessionId, client) ->
+                try {
+                    processUpdate(sessionId, client, feed)
+                } catch (e: Exception) {
+                    log.error("Error processing update for session {}: {}", sessionId, e.message, e)
+                    unregister(sessionId)
                 }
             }
         }
     }
 
-    private fun sendUpdate(client: ConnectedClient, feeds: List<FeedResponse>) {
-        val wsMsg = WsMessage.data(feeds).toJson()
-        client.session.send(Mono.just(client.session.textMessage(wsMsg))).subscribe()
+    private fun cleanupDeadSessions() {
+        val deadSessions = clients.filter { !it.value.session.isOpen }
+        deadSessions.forEach { (sessionId, _) ->
+            log.warn("Removing dead session: {}", sessionId)
+            unregister(sessionId)
+        }
     }
+
+    private fun processUpdate(sessionId: String, client: ConnectedClient, feed: FeedResponse) {
+        val hasRole = feed.roleIds.isEmpty() || client.roleIds.any { it in feed.roleIds }
+        val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
+
+        when {
+            // 🟢 СЛУЧАЙ 1: Уведомление архивировано
+            feed.archived -> {
+                if (existingIndex != -1) {
+                    client.feed.removeAt(existingIndex)
+                    send(client, WsMessage.delete(listOf(feed.id)))  // 🎯 Упрощено
+                    log.debug("Sent DELETE for notification {} to session {}", feed.id, sessionId)
+                }
+            }
+
+            // 🟢 СЛУЧАЙ 2: Роли изменились, пользователь больше не имеет доступа
+            existingIndex != -1 && !hasRole -> {
+                client.feed.removeAt(existingIndex)
+                send(client, WsMessage.delete(listOf(feed.id)))  // 🎯 Упрощено
+                log.debug("Removed notification {} from session {} (role access revoked)", feed.id, sessionId)
+            }
+
+            // 🟢 СЛУЧАЙ 3: Новое уведомление для пользователя
+            existingIndex == -1 && hasRole -> {
+                client.feed.add(feed)
+                send(client, WsMessage.data(listOf(feed)))  // 🎯 Упрощено
+                log.debug("Added new notification {} to session {}", feed.id, sessionId)
+            }
+
+            // 🟢 СЛУЧАЙ 4: Обновление существующего уведомления
+            existingIndex != -1 && hasRole -> {
+                client.feed[existingIndex] = feed
+                send(client, WsMessage.data(listOf(feed)))  // 🎯 Упрощено
+                log.debug("Updated notification {} for session {}", feed.id, sessionId)
+            }
+        }
+    }
+
+    // 🎯 УНИВЕРСАЛЬНЫЙ метод отправки (вместо sendData и sendDelete)
+    private fun send(client: ConnectedClient, wsMessage: WsMessage) {
+        try {
+            val json = wsMessage.toJson()
+            client.session.send(Mono.just(client.session.textMessage(json)))
+                .doOnError { e ->
+                    log.error("Failed to send {} to {}: {}", 
+                        wsMessage.type, client.session.id, e.message)
+                    unregister(client.session.id)
+                }
+                .subscribe()
+        } catch (e: Exception) {
+            log.error("Error sending {} message to {}", 
+                wsMessage.type, client.session.id, e)
+            unregister(client.session.id)
+        }
+    }
+
+    // 🆕 Методы для мониторинга
+    fun getConnectedClientsCount(): Int = clients.size
+    
+    fun getClientsByRole(roleId: Int): Int = 
+        clients.count { it.value.roleIds.contains(roleId) }
+    
+    fun getAllSessions(): List<String> = clients.keys.toList()
 }
