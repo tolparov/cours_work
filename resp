@@ -1,0 +1,16 @@
+package ru.sber.poirot.notifications.admin.dto
+
+import ru.sber.poirot.notifications.common.entity.AdminNotification
+
+class FeedResponse(
+    val id: Long,
+    val type: String,
+    val message: String
+)
+
+fun AdminNotification.toFeedResponse(): FeedResponse =
+    FeedResponse(
+        id = id,
+        type = type,
+        message = message
+    )
