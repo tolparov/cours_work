@@ -5,7 +5,6 @@ import org.springframework.web.bind.annotation.*
 import ru.sber.permissions.HAS_MANAGE_NOTIFICATIONS
 import ru.sber.poirot.audit.AuditClient
 import ru.sber.poirot.notifications.admin.dto.CreateRequest
-import ru.sber.poirot.notifications.admin.dto.FeedResponse
 import ru.sber.poirot.notifications.admin.dto.NotificationResponse
 import ru.sber.poirot.notifications.admin.dto.UpdateRequest
 
@@ -43,7 +42,4 @@ class AdminNotificationController(
         auditClient.audit(event = "NOTIFICATION_FETCH_ALL") {
             service.fetchAll()
         }
-
-    @GetMapping("/feed")
-    suspend fun feed(): List<FeedResponse> = service.feed()
 }
