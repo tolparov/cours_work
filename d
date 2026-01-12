@@ -9,6 +9,7 @@ data class WsMessage(
 ) {
     enum class Type {
         @JsonProperty("data") DATA,
+        @JsonProperty("delete") DELETE,
         @JsonProperty("subscribe") SUBSCRIBE,
         @JsonProperty("ping") PING,
         @JsonProperty("error") ERROR
@@ -16,6 +17,7 @@ data class WsMessage(
 
     companion object {
         fun data(payload: List<FeedResponse>) = WsMessage(Type.DATA, data = payload)
+        fun delete(ids: List<Long>) = WsMessage(Type.DELETE, data = ids)
         fun ping() = WsMessage(Type.PING)
         fun error(msg: String) = WsMessage(Type.ERROR, message = msg)
     }
