@@ -1,0 +1,52 @@
+private fun processUpdate(sessionId: String, client: ConnectedClient, feed: FeedResponse) {
+    val hasRole = feed.roleIds.isEmpty() || client.roleIds.any { it in feed.roleIds }
+
+    when {
+        // 🟢 Случай 1: Архивация
+        feed.archived -> {
+            val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
+            if (existingIndex != -1) {
+                client.feed.removeAt(existingIndex)
+                sendFullFeed(client)  // 🎯 Отправляем весь актуальный список
+            }
+        }
+
+        // 🟢 Случай 2: Отзыв доступа
+        !hasRole -> {
+            val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
+            if (existingIndex != -1) {
+                client.feed.removeAt(existingIndex)
+                sendFullFeed(client)  // 🎯 Отправляем весь актуальный список
+            }
+        }
+
+        // 🟢 Случай 3: Новое уведомление
+        else -> {
+            val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
+            if (existingIndex != -1) {
+                client.feed[existingIndex] = feed
+            } else {
+                client.feed.add(feed)
+            }
+            sendFullFeed(client)  // 🎯 Отправляем весь актуальный список
+        }
+    }
+}
+
+// 🎯 Единый метод отправки
+private fun sendFullFeed(client: ConnectedClient) {
+    try {
+        val activeMessages = client.feed.filter { !it.archived }  // Только активные
+        val wsMsg = WsMessage.data(activeMessages).toJson()
+        
+        client.session.send(Mono.just(client.session.textMessage(wsMsg)))
+            .doOnError { e ->
+                log.error("Failed to send feed to {}: {}", client.session.id, e.message)
+                unregister(client.session.id)
+            }
+            .subscribe()
+    } catch (e: Exception) {
+        log.error("Error sending feed", e)
+        unregister(client.session.id)
+    }
+}
