@@ -1,72 +1,20 @@
-package ru.sber.poirot.arbitration.shared.query
+fun List<BasketRecord>.sortedBy(sortField: String?, sortOrder: String?): List<BasketRecord> {
+    if (sortField == null || sortOrder == null) return this
 
-import org.springframework.stereotype.Service
-import ru.sber.poirot.engine.dsl.Filter
-import ru.sber.poirot.engine.dsl.Order
-import ru.sber.poirot.engine.dsl.invoke
-import ru.sber.poirot.engine.dsl.metamodel.PrimitiveField
-import ru.sber.poirot.engine.metamodel.ArbitrationRecordMM
-import ru.sber.poirot.engine.metamodel.arbitrationRecord
-import kotlin.reflect.KProperty1
-
-@Service
-class ConditionsBuilder {
-    private val record = arbitrationRecord
-
-    suspend fun build(
-        request: ItemsRequest?,
-        buildCustomFilter: suspend ArbitrationRecordMM.() -> Filter?
-    ): QueryConditions {
-        if (request == null) return QueryConditions.default
-        val dateFilter = record {
-            creationDateTime greaterThanOrEqualTo request.fromDateTime
-            creationDateTime lessThan request.toDateTime
-        }
-        val customFilter = record.buildCustomFilter()
-        return QueryConditions(
-            orderBy = listOf(property(request.sortField)),
-            order = order(request.sortOrder),
-            filter = listOfNotNull(dateFilter, customFilter).reduce(Filter::and)
-        )
+    val comparator = when (sortField) {
+        "date", "creationDate" -> compareBy<BasketRecord> { it.record.date }
+        "name" -> compareBy(nullsLast()) { it.record.name?.lowercase() }
+        "appId" -> compareBy(nullsLast()) { it.record.appId }
+        "inn" -> compareBy(nullsLast()) { it.record.inn }
+        "status" -> compareBy { it.record.status.lowercase() }
+        "executorFio" -> compareBy(nullsLast()) { it.record.executorFio?.lowercase() }
+        "type" -> compareBy { it.type }
+        else -> return this // Неизвестное поле - не сортируем
     }
 
-    private fun property(fieldName: String): PrimitiveField<Any> =
-        propertyBy(fieldName).get(record)
-
-    @Suppress("UNCHECKED_CAST")
-    private fun propertyBy(fieldName: String): KProperty1<ArbitrationRecordMM, PrimitiveField<Any>> =
-        when (fieldName) {
-            "creationDate" -> ArbitrationRecordMM::creationDateTime
-            "changed" -> ArbitrationRecordMM::changed
-            "status" -> ArbitrationRecordMM::status
-            "appId" -> ArbitrationRecordMM::applicationId
-            else -> throw IllegalArgumentException("Unknown field name")
-        } as KProperty1<ArbitrationRecordMM, PrimitiveField<Any>>
-
-    private fun order(type: String): Order =
-        when (type) {
-            "asc" -> Order.ASC
-            "desc" -> Order.DESC
-            else -> throw IllegalArgumentException("Unknown sort order type: $type")
-        }
-}package ru.sber.poirot.arbitration.shared.query
-
-import java.time.LocalDate
-import java.time.LocalDateTime
-
-open class ItemsRequest(
-    val fromDate: LocalDate,
-    val toDate: LocalDate,
-    val filters: List<ItemsFilter>,
-    val sortOrder: String,
-    val sortField: String,
-) {
-    val fromDateTime: LocalDateTime = fromDate.atStartOfDay()
-    val toDateTime: LocalDateTime = toDate.plusDays(1).atStartOfDay()
-
-    override fun toString(): String {
-        return "(fromDate=$fromDate, toDate=$toDate, filters=$filters, sortOrder='$sortOrder', sortField='$sortField', fromDateTime=$fromDateTime, toDateTime=$toDateTime)"
+    return when (sortOrder.lowercase()) {
+        "asc" -> this.sortedWith(comparator)
+        "desc" -> this.sortedWith(comparator.reversed())
+        else -> this // Неизвестный порядок - не сортируем
     }
-
-
-} 
+}
