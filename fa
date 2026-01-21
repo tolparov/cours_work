@@ -1,52 +1,72 @@
-private fun processUpdate(sessionId: String, client: ConnectedClient, feed: FeedResponse) {
-    val hasRole = feed.roleIds.isEmpty() || client.roleIds.any { it in feed.roleIds }
+package ru.sber.poirot.arbitration.shared.query
 
-    when {
-        // 🟢 Случай 1: Архивация
-        feed.archived -> {
-            val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
-            if (existingIndex != -1) {
-                client.feed.removeAt(existingIndex)
-                sendFullFeed(client)  // 🎯 Отправляем весь актуальный список
-            }
-        }
+import org.springframework.stereotype.Service
+import ru.sber.poirot.engine.dsl.Filter
+import ru.sber.poirot.engine.dsl.Order
+import ru.sber.poirot.engine.dsl.invoke
+import ru.sber.poirot.engine.dsl.metamodel.PrimitiveField
+import ru.sber.poirot.engine.metamodel.ArbitrationRecordMM
+import ru.sber.poirot.engine.metamodel.arbitrationRecord
+import kotlin.reflect.KProperty1
 
-        // 🟢 Случай 2: Отзыв доступа
-        !hasRole -> {
-            val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
-            if (existingIndex != -1) {
-                client.feed.removeAt(existingIndex)
-                sendFullFeed(client)  // 🎯 Отправляем весь актуальный список
-            }
-        }
+@Service
+class ConditionsBuilder {
+    private val record = arbitrationRecord
 
-        // 🟢 Случай 3: Новое уведомление
-        else -> {
-            val existingIndex = client.feed.indexOfFirst { it.id == feed.id }
-            if (existingIndex != -1) {
-                client.feed[existingIndex] = feed
-            } else {
-                client.feed.add(feed)
-            }
-            sendFullFeed(client)  // 🎯 Отправляем весь актуальный список
+    suspend fun build(
+        request: ItemsRequest?,
+        buildCustomFilter: suspend ArbitrationRecordMM.() -> Filter?
+    ): QueryConditions {
+        if (request == null) return QueryConditions.default
+        val dateFilter = record {
+            creationDateTime greaterThanOrEqualTo request.fromDateTime
+            creationDateTime lessThan request.toDateTime
         }
+        val customFilter = record.buildCustomFilter()
+        return QueryConditions(
+            orderBy = listOf(property(request.sortField)),
+            order = order(request.sortOrder),
+            filter = listOfNotNull(dateFilter, customFilter).reduce(Filter::and)
+        )
     }
-}
 
-// 🎯 Единый метод отправки
-private fun sendFullFeed(client: ConnectedClient) {
-    try {
-        val activeMessages = client.feed.filter { !it.archived }  // Только активные
-        val wsMsg = WsMessage.data(activeMessages).toJson()
-        
-        client.session.send(Mono.just(client.session.textMessage(wsMsg)))
-            .doOnError { e ->
-                log.error("Failed to send feed to {}: {}", client.session.id, e.message)
-                unregister(client.session.id)
-            }
-            .subscribe()
-    } catch (e: Exception) {
-        log.error("Error sending feed", e)
-        unregister(client.session.id)
+    private fun property(fieldName: String): PrimitiveField<Any> =
+        propertyBy(fieldName).get(record)
+
+    @Suppress("UNCHECKED_CAST")
+    private fun propertyBy(fieldName: String): KProperty1<ArbitrationRecordMM, PrimitiveField<Any>> =
+        when (fieldName) {
+            "creationDate" -> ArbitrationRecordMM::creationDateTime
+            "changed" -> ArbitrationRecordMM::changed
+            "status" -> ArbitrationRecordMM::status
+            "appId" -> ArbitrationRecordMM::applicationId
+            else -> throw IllegalArgumentException("Unknown field name")
+        } as KProperty1<ArbitrationRecordMM, PrimitiveField<Any>>
+
+    private fun order(type: String): Order =
+        when (type) {
+            "asc" -> Order.ASC
+            "desc" -> Order.DESC
+            else -> throw IllegalArgumentException("Unknown sort order type: $type")
+        }
+}package ru.sber.poirot.arbitration.shared.query
+
+import java.time.LocalDate
+import java.time.LocalDateTime
+
+open class ItemsRequest(
+    val fromDate: LocalDate,
+    val toDate: LocalDate,
+    val filters: List<ItemsFilter>,
+    val sortOrder: String,
+    val sortField: String,
+) {
+    val fromDateTime: LocalDateTime = fromDate.atStartOfDay()
+    val toDateTime: LocalDateTime = toDate.plusDays(1).atStartOfDay()
+
+    override fun toString(): String {
+        return "(fromDate=$fromDate, toDate=$toDate, filters=$filters, sortOrder='$sortOrder', sortField='$sortField', fromDateTime=$fromDateTime, toDateTime=$toDateTime)"
     }
-}
+
+
+} 
