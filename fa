@@ -7,44 +7,35 @@ import org.springframework.stereotype.Service
 import ru.sber.poirot.basket.api.UnifiedBasket
 import ru.sber.poirot.basket.api.impl.RequestFilter.Companion.filterFrom
 import ru.sber.poirot.basket.api.model.RecordsRequest
-import ru.sber.poirot.basket.common.BasketRecord
 import ru.sber.poirot.basket.common.RecordsResponse
 import ru.sber.poirot.basket.common.SourceResponse
-import ru.sber.poirot.basket.common.toErrorMessages
-import ru.sber.poirot.basket.common.toRecords
-import ru.sber.poirot.basket.common.sortedBy
 import ru.sber.poirot.paging.forPageWith
+import ru.sber.poirot.basket.common.toRecords
 import ru.sber.utils.optimizedPartition
 import ru.sber.poirot.basket.api.impl.ProcessType.MON_KSB
+import ru.sber.poirot.basket.common.BasketRecord
+import ru.sber.poirot.basket.common.sortedBy
+import ru.sber.poirot.basket.common.toErrorMessages
+import ru.sber.poirot.userinfoprovider.UserInfoProvider
 
 @Service
 class UnifiedBasketImpl(
     private val basketLoaders: List<BasketLoader>,
+    private val userInfoProvider: UserInfoProvider
 ) : UnifiedBasket {
-    
+
     override suspend fun loadRecords(request: RecordsRequest): RecordsResponse =
         loadRecordsInternal(
-            request = request,
-            includeStatusFilter = true,
-            withPagination = false,
-            includeSchemeRecords = true,
-            withSorting = false
-        )
+            request, includeStatusFilter = true, withPagination = false, withSorting = false)
 
-    override suspend fun loadTaskFlowRecords(request: RecordsRequest): RecordsResponse =
+    override suspend fun loadFlowRecords(request: RecordsRequest): RecordsResponse =
         loadRecordsInternal(
-            request = request,
-            includeStatusFilter = false,
-            withPagination = true,
-            includeSchemeRecords = false,
-            withSorting = true
-        )
+            request, includeStatusFilter = false, withPagination = true, withSorting = true)
 
     private suspend fun loadRecordsInternal(
         request: RecordsRequest,
         includeStatusFilter: Boolean,
         withPagination: Boolean,
-        includeSchemeRecords: Boolean,
         withSorting: Boolean,
     ): RecordsResponse {
         val requestFilter = filterFrom(request, includeStatusFilter)
@@ -52,7 +43,7 @@ class UnifiedBasketImpl(
 
         val (successResponses, errorResponses) = basketLoaders
             .filter { it.type in effectiveTypes }
-            .loadRecords(request, includeSchemeRecords)
+            .loadRecords(request)
             .optimizedPartition { it.success }
 
         val filteredRecords = successResponses.toRecords()
@@ -93,7 +84,7 @@ class UnifiedBasketImpl(
             records
         }
 
-    private fun applyPagination(
+    private suspend fun applyPagination(
         records: List<BasketRecord>,
         request: RecordsRequest,
         withPagination: Boolean
@@ -102,20 +93,25 @@ class UnifiedBasketImpl(
             val rowsOnPage = request.rowsOnPage ?: -1
             val offset = request.offset
             val total = records.size
-            val paginatedRecords = records.forPageWith(offset, rowsOnPage)
+            val paginatedRecords = records.forPageWith(offset, rowsOnPage).map { enrichWithExecutorFio(it) }
             paginatedRecords to total
         } else {
             records to null
         }
 
-    private suspend fun List<BasketLoader>.loadRecords(
-        request: RecordsRequest,
-        includeSchemeRecords: Boolean
-    ): List<SourceResponse> = coroutineScope {
-        map { loader -> 
-            async { 
-                loader.getRecords(request, includeSchemeRecords) 
-            } 
-        }.awaitAll()
+    private suspend fun enrichWithExecutorFio(record: BasketRecord): BasketRecord {
+        val executorUsername = record.record.executorFio
+        return if (executorUsername != null) {
+            val executorFio = userInfoProvider.getFioByUsername(executorUsername)
+            record.copy(
+                record = record.record.copy(executorFio = executorFio)
+            )
+        } else {
+            record
+        }
+    }
+
+    private suspend fun List<BasketLoader>.loadRecords(request: RecordsRequest): List<SourceResponse> = coroutineScope {
+        map { loader -> async { loader.getRecords(request) } }.awaitAll()
     }
 }
