@@ -1,20 +1,121 @@
-fun List<BasketRecord>.sortedBy(sortField: String?, sortOrder: String?): List<BasketRecord> {
-    if (sortField == null || sortOrder == null) return this
+package ru.sber.poirot.basket.api.impl
 
-    val comparator = when (sortField) {
-        "date", "creationDate" -> compareBy<BasketRecord> { it.record.date }
-        "name" -> compareBy(nullsLast()) { it.record.name?.lowercase() }
-        "appId" -> compareBy(nullsLast()) { it.record.appId }
-        "inn" -> compareBy(nullsLast()) { it.record.inn }
-        "status" -> compareBy { it.record.status.lowercase() }
-        "executorFio" -> compareBy(nullsLast()) { it.record.executorFio?.lowercase() }
-        "type" -> compareBy { it.type }
-        else -> return this // Неизвестное поле - не сортируем
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import org.springframework.stereotype.Service
+import ru.sber.poirot.basket.api.UnifiedBasket
+import ru.sber.poirot.basket.api.impl.RequestFilter.Companion.filterFrom
+import ru.sber.poirot.basket.api.model.RecordsRequest
+import ru.sber.poirot.basket.common.BasketRecord
+import ru.sber.poirot.basket.common.RecordsResponse
+import ru.sber.poirot.basket.common.SourceResponse
+import ru.sber.poirot.basket.common.toErrorMessages
+import ru.sber.poirot.basket.common.toRecords
+import ru.sber.poirot.basket.common.sortedBy
+import ru.sber.poirot.paging.forPageWith
+import ru.sber.utils.optimizedPartition
+import ru.sber.poirot.basket.api.impl.ProcessType.MON_KSB
+
+@Service
+class UnifiedBasketImpl(
+    private val basketLoaders: List<BasketLoader>,
+) : UnifiedBasket {
+    
+    override suspend fun loadRecords(request: RecordsRequest): RecordsResponse =
+        loadRecordsInternal(
+            request = request,
+            includeStatusFilter = true,
+            withPagination = false,
+            includeSchemeRecords = true,
+            withSorting = false
+        )
+
+    override suspend fun loadTaskFlowRecords(request: RecordsRequest): RecordsResponse =
+        loadRecordsInternal(
+            request = request,
+            includeStatusFilter = false,
+            withPagination = true,
+            includeSchemeRecords = false,
+            withSorting = true
+        )
+
+    private suspend fun loadRecordsInternal(
+        request: RecordsRequest,
+        includeStatusFilter: Boolean,
+        withPagination: Boolean,
+        includeSchemeRecords: Boolean,
+        withSorting: Boolean,
+    ): RecordsResponse {
+        val requestFilter = filterFrom(request, includeStatusFilter)
+        val effectiveTypes = getEffectiveTypes(requestFilter.types)
+
+        val (successResponses, errorResponses) = basketLoaders
+            .filter { it.type in effectiveTypes }
+            .loadRecords(request, includeSchemeRecords)
+            .optimizedPartition { it.success }
+
+        val filteredRecords = successResponses.toRecords()
+            .map { mapRecordType(it) }
+            .filter { requestFilter.check(it) }
+
+        val sortedRecords = applySorting(filteredRecords, request, withSorting)
+        val (paginatedRecords, totalCount) = applyPagination(sortedRecords, request, withPagination)
+
+        return RecordsResponse(
+            records = paginatedRecords,
+            warningMessages = errorResponses.toErrorMessages(),
+            totalCount = totalCount
+        )
     }
 
-    return when (sortOrder.lowercase()) {
-        "asc" -> this.sortedWith(comparator)
-        "desc" -> this.sortedWith(comparator.reversed())
-        else -> this // Неизвестный порядок - не сортируем
+    private fun getEffectiveTypes(types: List<ProcessType>): List<ProcessType> =
+        types.map { if (it == MON_KSB) ProcessType.FOCUS_MONITORING else it }
+
+    private fun mapRecordType(record: BasketRecord): BasketRecord {
+        val processType = (record.record.metadata as? Map<*, *>)?.get("processType")
+        val type = when {
+            record.type == ProcessType.FOCUS_MONITORING.type && processType == 11 -> MON_KSB.type
+            record.type == ProcessType.FOCUS_MONITORING.type && processType == 12 -> MON_KSB.type
+            else -> record.type
+        }
+        return record.copy(type = type)
+    }
+
+    private fun applySorting(
+        records: List<BasketRecord>,
+        request: RecordsRequest,
+        withSorting: Boolean
+    ): List<BasketRecord> =
+        if (withSorting) {
+            records.sortedBy(request.sortField, request.sortOrder)
+        } else {
+            records
+        }
+
+    private fun applyPagination(
+        records: List<BasketRecord>,
+        request: RecordsRequest,
+        withPagination: Boolean
+    ): Pair<List<BasketRecord>, Int?> =
+        if (withPagination) {
+            val rowsOnPage = request.rowsOnPage ?: -1
+            val offset = request.offset
+            val total = records.size
+            val paginatedRecords = records.forPageWith(offset, rowsOnPage)
+            paginatedRecords to total
+        } else {
+            records to null
+        }
+
+    private suspend fun List<BasketLoader>.loadRecords(
+        request: RecordsRequest,
+        includeSchemeRecords: Boolean
+    ): List<SourceResponse> = coroutineScope {
+        map { loader -> 
+            async { 
+                loader.getRecords(request, includeSchemeRecords) 
+            } 
+        }.awaitAll()
     }
 }
