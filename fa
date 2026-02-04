@@ -1,15 +1,15 @@
 @Component
-class NotificationExpirationScheduler(
+class NotificationSyncScheduler(
     private val adminNotificationsDao: AdminNotificationsDao
 ) {
 
     private val log = logger()
 
     /**
-     * Каждые 30 секунд синхронизирует клиентов с актуальным кешем.
-     * Кеш обновляется автоматически раз в минуту (about1Min).
+     * Синхронизирует клиентов с актуальным кешем каждые 60 секунд.
+     * Совпадает с интервалом обновления кеша (about1Min).
      */
-    @Scheduled(fixedDelay = 30000, initialDelay = 30000)
+    @Scheduled(fixedDelay = 60000, initialDelay = 60000)  // 🟢 60 сек вместо 30
     fun syncClientsFromCache() {
         try {
             val clientsCount = BroadcastRegistry.getConnectedClientsCount()
@@ -20,12 +20,12 @@ class NotificationExpirationScheduler(
             
             log.debug("🔄 Syncing {} connected clients from cache", clientsCount)
             
-            // 🟢 Читаем ВСЕ из кеша (уже отфильтрованные по dateTo/dateFrom/publish/archive)
             val allNotifications = adminNotificationsDao.feedAll()
                 .map { it.toFeedResponse() }
             
             if (allNotifications.isEmpty()) {
                 log.debug("📭 No active notifications in cache")
+                BroadcastRegistry.syncFromCache(emptyList())
                 return
             }
             
