@@ -1,20 +1,27 @@
-@Scheduled(fixedDelay = 30000, initialDelay = 30000)
+@Component
+class NotificationExpirationScheduler(
+    private val adminNotificationsDao: AdminNotificationsDao
+) {
+
+    private val log = logger()
+
+    /**
+     * Каждые 30 секунд синхронизирует клиентов с актуальным кешем.
+     * Кеш обновляется автоматически раз в минуту (about1Min).
+     */
+    @Scheduled(fixedDelay = 30000, initialDelay = 30000)
     fun syncClientsFromCache() {
         try {
             val clientsCount = BroadcastRegistry.getConnectedClientsCount()
             
             if (clientsCount == 0) {
-                // Нет подключенных клиентов - нечего синхронизировать
                 return
             }
             
             log.debug("🔄 Syncing {} connected clients from cache", clientsCount)
             
-            // 🟢 Получаем актуальные данные из кеша для "всех ролей"
-            // feed() вернет отфильтрованные данные, но нам нужны ВСЕ
-            // Поэтому используем fetchAll() или прямой доступ к кешу
-            val allNotifications = adminNotificationsDao.fetchAll()
-                .filter { it.publish && !it.archive }
+            // 🟢 Читаем ВСЕ из кеша (уже отфильтрованные по dateTo/dateFrom/publish/archive)
+            val allNotifications = adminNotificationsDao.feedAll()
                 .map { it.toFeedResponse() }
             
             if (allNotifications.isEmpty()) {
@@ -25,52 +32,10 @@
             log.info("📢 Syncing {} notifications to {} clients from cache", 
                 allNotifications.size, clientsCount)
             
-            // Синхронизируем всех клиентов на ЭТОМ поде
             BroadcastRegistry.syncFromCache(allNotifications)
             
         } catch (e: Exception) {
             log.error("❌ Error syncing clients from cache: {}", e.message, e)
         }
     }
-
-
-fun syncFromCache(allNotifications: List<FeedResponse>) {
-        if (clients.isEmpty()) {
-            return
-        }
-        
-        log.info("🔄 [{}] Syncing {} notifications to {} clients from cache", 
-            POD_ID, allNotifications.size, clients.size)
-        
-        cleanupDeadSessions()
-        
-        clients.values.toList().forEach { client ->
-            try {
-                syncClientFromCache(client, allNotifications)
-            } catch (e: Exception) {
-                log.error("❌ Error syncing client {}: {}", 
-                    client.session.id, e.message, e)
-                unregister(client.session.id)
-            }
-        }
-    }
-
-    private fun syncClientFromCache(
-        client: ConnectedClient,
-        allNotifications: List<FeedResponse>
-    ) {
-        // Фильтруем уведомления подходящие для этого клиента
-        val relevantForClient = allNotifications.filter { notification ->
-            shouldShowNotification(client, notification)
-        }
-        
-        // Полностью заменяем feed клиента актуальными данными
-        client.feed.clear()
-        client.feed.addAll(relevantForClient)
-        
-        log.debug("📨 [{}] Synced client {}: {} notifications", 
-            POD_ID, client.session.id, relevantForClient.size)
-        
-        // Отправляем обновленный список клиенту
-        sendThroughSink(client)
-    }
+}
